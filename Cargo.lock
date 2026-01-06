@@ -568,6 +568,7 @@ name = "vortex-io"
 version = "0.1.0"
 dependencies = [
  "core_affinity",
+ "crossbeam-utils",
  "hwloc2",
  "io-uring",
  "libc",
@@ -578,6 +579,10 @@ dependencies = [
 [[package]]
 name = "vortex-rpc"
 version = "0.1.0"
+dependencies = [
+ "bytecheck",
+ "rkyv",
+]
 
 [[package]]
 name = "vortex-server"
@@ -587,6 +592,7 @@ dependencies = [
  "log",
  "vortex-core",
  "vortex-io",
+ "vortex-rpc",
 ]
 
 [[package]]

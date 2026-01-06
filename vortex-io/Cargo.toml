@@ -10,3 +10,4 @@ nix = { version = "0.27", features = ["sched", "mman"] }
 libc = "0.2"
 hwloc2 = "2.2.0"
 log = "0.4"
+crossbeam-utils = "0.8"
