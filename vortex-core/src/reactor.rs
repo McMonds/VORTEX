@@ -1,5 +1,5 @@
 use vortex_io::ring::RingDriver;
-use vortex_io::memory::{BufferPool, BufferLease};
+use vortex_io::memory::BufferPool;
 use vortex_io::net::VortexListener;
 use crate::storage::wal::WalManager;
 use vortex_rpc::VBP_MAGIC;
@@ -20,9 +20,9 @@ pub struct ShardReactor {
     listener: Option<VortexListener>,
     wal: WalManager,
     // Shard-local in-memory state (Rule 6: Share Nothing)
-    memtable: HashMap<u64, Vec<f32>>,
+    _memtable: HashMap<u64, Vec<f32>>,
     pending_submissions: u32,
-    active_leases: Vec<Option<BufferLease>>,
+    active_leases: Vec<Option<vortex_io::memory::BufferLease>>,
 }
 
 impl ShardReactor {
@@ -39,7 +39,7 @@ impl ShardReactor {
             pool,
             listener: None,
             wal,
-            memtable: HashMap::new(),
+            _memtable: HashMap::new(),
             pending_submissions: 0,
             active_leases: vec![None; ring_entries as usize],
         }

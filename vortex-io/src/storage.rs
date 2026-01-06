@@ -5,7 +5,7 @@ use io_uring::{opcode, types};
 use log::info;
 
 pub struct DirectFile {
-    file: File,
+    _file: File,
     fd: RawFd,
 }
 
@@ -21,7 +21,7 @@ impl DirectFile {
         
         let fd = file.as_raw_fd();
         info!("WAL File opened with O_DIRECT at {} (fd: {})", path, fd);
-        Ok(Self { file, fd })
+        Ok(Self { _file: file, fd })
     }
 
     pub fn fd(&self) -> RawFd {

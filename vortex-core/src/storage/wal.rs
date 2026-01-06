@@ -1,6 +1,5 @@
 use vortex_io::storage::DirectFile;
 use log::info;
-use std::path::Path;
 
 pub struct WalManager {
     file: DirectFile,
