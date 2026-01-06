@@ -8,7 +8,7 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let search_only = args.contains(&"--search-only".to_string());
 
-    let addr = "127.0.0.1:9000";
+    let addr = "127.0.0.1:8080";
     println!("Connecting to VORTEX at {}...", addr);
     let mut stream = TcpStream::connect(addr)?;
 

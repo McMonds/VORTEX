@@ -1,6 +1,7 @@
 pub mod hnsw;
 pub mod distance;
 pub mod simd;
+pub mod quantization;
 
 pub trait VectorIndex {
     fn insert(&mut self, id: u64, vector: &[f32]);

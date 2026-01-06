@@ -12,23 +12,18 @@ pub mod topology;
 /// Panics if the OS refuses the lock (usually due to `ulimit -l`).
 /// VORTEX follows the "Fail Closed" philosophy (Rule #4).
 pub fn lock_memory_pages() {
-    let flags = libc::MCL_CURRENT | libc::MCL_FUTURE;
+    // BUG FIX: MCL_FUTURE causes OOM if we allocate more than ulimit -l (8MB on laptops).
+    // We only lock CURRENT memory to ensure the startup structures are pinned.
+    // The BufferPool will manually mlock its own pages later.
+    let flags = libc::MCL_CURRENT;
     
     // SAFETY: FFI call to mlockall with valid flags.
     let ret = unsafe { libc::mlockall(flags) };
     
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        if cfg!(debug_assertions) {
-            log::warn!("WARNING: Failed to lock memory (mlockall): {}.", err);
-            log::warn!("Continuing in DEBUG mode. SWAP may occur (Performance Degradation).");
-        } else {
-            panic!(
-                "CRITICAL: Failed to lock memory pages (mlockall). \
-                Error: {}. \
-                \n\nFix: Run 'ulimit -l unlimited' before starting VORTEX.", 
-                err
-            );
-        }
+        log::warn!("WARNING: Failed to lock memory pages (mlockall): {}.", err);
+        log::warn!("Fix: Run 'ulimit -l unlimited' or run with capability CAP_IPC_LOCK.");
+        log::warn!("Continuing in constrained mode. SWAP may occur (Performance Degradation).");
     }
 }

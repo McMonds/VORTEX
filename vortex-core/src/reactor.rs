@@ -36,18 +36,21 @@ pub struct ShardReactor {
     // Zero-Allocation Recycled Buffers
     completions_buffer: Vec<(u64, i32)>,
     scratch_query_buffer: Box<[f32; 128]>,
+    
+    // TCP Reassembly (Milestone 5 Hardening)
+    accumulated_bytes: Vec<usize>, 
 }
 
 impl ShardReactor {
-    pub fn new(shard_id: usize, ring_entries: u32) -> Self {
+    pub fn new(shard_id: usize, ring_entries: u32, max_elements: usize) -> Self {
         let ring = RingDriver::new(ring_entries).expect("Failed to init io_uring");
         let pool = BufferPool::new(ring_entries as usize, 4096);
         
         // Initialize WAL in current directory for now
         let mut wal = WalManager::new(shard_id, ".").expect("Failed to init WAL");
         
-        // Default dimension 128 for Milestone 5
-        let mut index = HnswIndex::new(128, 1_000_000);
+        // Dynamic dimension 128, capacity controlled by caller (Target 0 Scaling)
+        let mut index = HnswIndex::new(128, max_elements);
 
         // --- THE RESURRECTION (Phase 4 Recovery) ---
         let wal_path = format!("./shard_{}.wal", shard_id);
@@ -113,8 +116,9 @@ impl ShardReactor {
             active_fds: vec![None; ring_entries as usize],
             
             // Pre-allocate to avoid malloc in hot loop
-            completions_buffer: Vec::with_capacity(64),
+            completions_buffer: Vec::with_capacity(ring_entries as usize),
             scratch_query_buffer: Box::new([0.0f32; 128]),
+            accumulated_bytes: vec![0; ring_entries as usize],
         }
     }
 
@@ -202,18 +206,28 @@ impl ShardReactor {
     fn submit_read(&mut self, fd: RawFd) {
         if let Some(lease) = self.pool.lease() {
             let idx = lease.index;
-            let page = self.pool.get_page_mut(idx);
-            let buf = page.as_slice_mut();
-            let tag = TAG_READ_PREFIX | (idx as u64);
-            
-            let read_e = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
-                .build()
-                .user_data(tag);
-
-            self.push_submission(&read_e);
+            self.accumulated_bytes[idx] = 0; // Fresh connection/request
+            self.submit_read_at(fd, idx, 0);
             self.active_leases[idx] = Some(lease);
             self.active_fds[idx] = Some(fd);
         }
+    }
+
+    fn submit_read_at(&mut self, fd: RawFd, idx: usize, offset: usize) {
+        let page = self.pool.get_page_mut(idx);
+        let buf = page.as_slice_mut();
+        
+        if offset >= buf.len() {
+            error!("Shard {} Buffer Overflow prevention: read offset {} exceeds page size {}", self.shard_id, offset, buf.len());
+            return;
+        }
+
+        let tag = TAG_READ_PREFIX | (idx as u64);
+        let read_e = opcode::Read::new(types::Fd(fd), unsafe { buf.as_mut_ptr().add(offset) }, (buf.len() - offset) as u32)
+            .build()
+            .user_data(tag);
+
+        self.push_submission(&read_e);
     }
 
     /// Formats the response buffer using the *same* lease (Zero-Copy recycle).
@@ -280,16 +294,34 @@ impl ShardReactor {
             if let Some(lease) = self.active_leases[idx].take() {
                 self.pool.release(lease);
             }
+            self.active_fds[idx] = None;
+            self.accumulated_bytes[idx] = 0;
             return;
         }
 
-        // 2. Protocol Guard (The Firewall)
-        // Check minimum size: Must be at least a Header.
-        if bytes < std::mem::size_of::<vortex_rpc::RequestHeader>() {
-            error!("Shard {} Ingress -> Protocol Violation: Packet too short ({} bytes). Dropping.", self.shard_id, bytes);
-            if let Some(lease) = self.active_leases[idx].take() {
-                self.pool.release(lease);
-            }
+        self.accumulated_bytes[idx] += bytes;
+        let total = self.accumulated_bytes[idx];
+
+        // 2. Protocol Reassembly (Target 3 Hardening)
+        // We need at least 16 bytes to know the payload length
+        if total < 16 {
+            debug!("Shard {} Partial Read ({} bytes). Waiting for header...", self.shard_id, total);
+            let fd = self.active_fds[idx].unwrap();
+            self.submit_read_at(fd, idx, total);
+            return;
+        }
+
+        // Peek at header to find expected length
+        let header = {
+            let page = self.pool.get_page_mut(idx);
+            let data = page.as_slice_mut();
+            unsafe { &*(data.as_ptr() as *const vortex_rpc::RequestHeader) }
+        };
+
+        let expected = 16 + header.payload_len as usize;
+        if total < expected {
+            let fd = self.active_fds[idx].unwrap();
+            self.submit_read_at(fd, idx, total);
             return;
         }
         
@@ -299,10 +331,8 @@ impl ShardReactor {
             let page = self.pool.get_page_mut(idx);
             let data = page.as_slice_mut();
             
-            match vortex_rpc::verify_header(&data[0..bytes]) {
+            match vortex_rpc::verify_header(&data[0..total]) {
                 Ok(h) => {
-                    info!("Shard {} Valid Packet: Opcode={}. (Magic: 0x{:x}, Len: {}).", 
-                        self.shard_id, h.opcode, h.magic, h.payload_len);
                     (h.opcode, h.request_id, data.as_ptr())
                 },
                 Err(e) => {
@@ -341,11 +371,10 @@ impl ShardReactor {
             },
             CMD_UPSERT => {
                 // Rule 9: Persistence Precedes Response
-                info!("Shard {} Ingress -> Submitting to WAL ({} bytes)", self.shard_id, bytes);
                 let tag = TAG_WAL_PREFIX | (idx as u64);
                 // Note: We write the FULL packet (Header + Payload) to the WAL for perfect reconstruction.
-                // We use the 'bytes' read from the socket (captured in arg), and data_ptr we extracted.
-                let wal_e = self.wal.write_entry(data_ptr, bytes as u32, tag);
+                // We use the 'total' read from the socket, and data_ptr we extracted.
+                let wal_e = self.wal.write_entry(data_ptr, total as u32, tag);
                 self.push_submission(&wal_e);
             },
             _ => {

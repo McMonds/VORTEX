@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Context, Result};
 
+const DEFAULT_MAX_ELEMENTS: usize = 1_000_000;
+const CONSTRAINED_MAX_ELEMENTS: usize = 10_000;
+
 /// VORTEX: The Kernel-Bypass Vector Database
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -19,6 +22,14 @@ struct Args {
     /// Directory for WAL and Storage
     #[arg(short, long, default_value = "./data")]
     dir: String,
+
+    /// Number of Shard Reactors to spawn (overrides hardware detection)
+    #[arg(short, long)]
+    shards: Option<usize>,
+
+    /// Max vectors per shard (overrides adaptive scaling)
+    #[arg(short, long)]
+    capacity: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -37,29 +48,31 @@ fn main() -> Result<()> {
     // 2. Interrogate Hardware
     info!("Phase 2: hardware topology detection...");
     let topology = SystemTopology::new();
-    let core_ids = topology.physical_cores();
-    let num_shards = core_ids.len();
+    let detected_cores = topology.physical_cores().len();
+    let available_gb = topology.available_ram() as f64 / 1e9;
     
-    // Development Mode Guard
-    if num_shards < 4 {
+    info!("Phase 3: calculating adaptive scaling...");
+    let (num_shards, max_elements) = if topology.is_constrained() && args.shards.is_none() && args.capacity.is_none() {
         warn!("============================================================");
-        warn!("WARNING: Running in Constrained Environment ({} cores).", num_shards);
-        warn!("VORTEX is optimized for high-core-count servers.");
-        warn!("Expect sub-optimal performance due to lack of isolation.");
+        warn!("ADAPTIVE SCALING ENGAGED: Constrained Environment Detected.");
+        warn!("Hardware: {} Cores, {:.2} GB Available RAM", detected_cores, available_gb);
+        warn!("Config: 1 Shard, {} Vector Local Capacity (LSS Optimized).", CONSTRAINED_MAX_ELEMENTS);
         warn!("============================================================");
-        // Wait so user sees the warning (UX)
-        std::thread::sleep(Duration::from_secs(2));
-    }
+        (1, CONSTRAINED_MAX_ELEMENTS)
+    } else {
+        let s = args.shards.unwrap_or(detected_cores);
+        let c = args.capacity.unwrap_or(if topology.is_constrained() { CONSTRAINED_MAX_ELEMENTS } else { DEFAULT_MAX_ELEMENTS });
+        info!("Performance Scaling: {} Shards, {} Vector Capacity per shard.", s, c);
+        (s, c)
+    };
 
-    info!("VORTEX detected {} physical cores: {:?}. Initializing Clustered Architecture...", num_shards, core_ids);
-
-    // 3. Pin Main Thread to Core 0 (Standard Rule 7/13)
+    // 4. Pin Main Thread to Core 0 (Standard Rule 7/13)
     info!("Phase 3: pinning control thread to core 0...");
     pin_thread_to_core(0);
 
-    // 4. Initialize Milestone 6 Shard Proxy (The Brain)
-    info!("Phase 4: initializing Shard Proxy...");
-    let proxy = Arc::new(vortex_core::proxy::ShardProxy::new(num_shards));
+    // 5. Initialize Milestone 6 Shard Proxy (The Brain)
+    info!("Phase 4: initializing Shard Proxy (Capacity: {}/shard)...", max_elements);
+    let proxy = Arc::new(vortex_core::proxy::ShardProxy::new(num_shards, max_elements));
     
     // 5. Setup Graceful Shutdown (Signal Handler)
     info!("Phase 5: registering signal handlers...");
