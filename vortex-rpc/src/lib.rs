@@ -23,6 +23,7 @@ pub enum Command {
     Query = 2,
     Delete = 3,
     Stats = 4,
+    Search = 5,
 }
 
 /// Example Payload for Vector Upsert

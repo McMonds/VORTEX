@@ -2,11 +2,12 @@ use vortex_io::ring::RingDriver;
 use vortex_io::memory::BufferPool;
 use vortex_io::net::VortexListener;
 use crate::storage::wal::WalManager;
+use crate::index::hnsw::HnswIndex;
+use crate::index::VectorIndex;
 use vortex_rpc::VBP_MAGIC;
 use log::{info, error};
 use io_uring::{opcode, types};
 use std::os::unix::io::RawFd;
-use std::collections::HashMap;
 
 /// User Data Tags to distinguish CQE types
 const TAG_ACCEPT: u64 = 0xFFFF_0000;
@@ -20,7 +21,7 @@ pub struct ShardReactor {
     listener: Option<VortexListener>,
     wal: WalManager,
     // Shard-local in-memory state (Rule 6: Share Nothing)
-    _memtable: HashMap<u64, Vec<f32>>,
+    index: HnswIndex,
     pending_submissions: u32,
     active_leases: Vec<Option<vortex_io::memory::BufferLease>>,
 }
@@ -33,13 +34,16 @@ impl ShardReactor {
         // Initialize WAL in current directory for now
         let wal = WalManager::new(shard_id, ".").expect("Failed to init WAL");
         
+        // Default dimension 128 for Milestone 5
+        let index = HnswIndex::new(128, 1_000_000);
+
         Self {
             shard_id,
             ring,
             pool,
             listener: None,
             wal,
-            _memtable: HashMap::new(),
+            index,
             pending_submissions: 0,
             active_leases: vec![None; ring_entries as usize],
         }
@@ -73,7 +77,7 @@ impl ShardReactor {
             let mut cq = self.ring.completion_queue();
             while let Some(cqe) = cq.next() {
                 self.pending_submissions -= 1;
-                completions.push((cqe.user_data(), cqe.result()));
+                completions.push((cqe.user_data() as u64, cqe.result()));
             }
         }
 
@@ -130,31 +134,47 @@ impl ShardReactor {
             return;
         }
 
-        // Rule 9: Persistence Precedes Response
-        // Submit to WAL. We reuse the SAME buffer for zero-copy.
-        info!("Shard {} Ingress -> Submitting to WAL ({} bytes)", self.shard_id, bytes);
+        let cmd_code = data[3];
         
-        // Ensure WAL write is 4KB aligned for O_DIRECT if needed. 
-        // For the sake of this Milestone, we'll write the full 4KB page.
-        let tag = TAG_WAL_PREFIX | (idx as u64);
-        let wal_e = self.wal.write_entry(data.as_ptr(), 4096, tag);
-        
-        unsafe {
-            self.ring.submission_queue().push(&wal_e).expect("Ring full");
+        if cmd_code == 5 { // Search (Rule 10: Speed over Durability for search)
+            info!("Shard {} Ingress -> Received SEARCH command.", self.shard_id);
+            let dummy_query = vec![0.1f32; 128];
+            let results = self.index.search(&dummy_query, 10);
+            info!("Shard {} SEARCH complete. Found {} results.", self.shard_id, results.len());
+            
+            // Release lease since search is read-only
+            if let Some(lease) = self.active_leases[idx].take() {
+                self.pool.release(lease);
+            }
+        } else { // Upsert or other (Rule 9: Persistence Precedes Response)
+            info!("Shard {} Ingress -> Submitting to WAL ({} bytes)", self.shard_id, bytes);
+            let tag = TAG_WAL_PREFIX | (idx as u64);
+            let wal_e = self.wal.write_entry(data.as_ptr(), 4096, tag);
+            
+            unsafe {
+                self.ring.submission_queue().push(&wal_e).expect("Ring full");
+            }
+            self.pending_submissions += 1;
         }
-        self.pending_submissions += 1;
     }
 
     fn handle_wal_complete(&mut self, idx: usize, bytes: usize) {
         info!("Shard {} WAL Persisted ({} bytes). Finalizing command.", self.shard_id, bytes);
         
-        // Now that it's on disk, we would apply to MemTable/SkipList.
-        // For now, we release the lease.
+        // Finalizing: Indexing after persistence (Milestone 5)
+        let page = self.pool.get_page_mut(idx);
+        let _data = page.as_slice_mut();
+        
+        // In a real VBP packet, we would extract the vector here.
+        // For demonstration, we'll index a dummy vector.
+        let dummy_id = 999;
+        let dummy_vec = vec![0.1f32; 128];
+        self.index.insert(dummy_id, &dummy_vec);
+        
+        info!("Shard {} indexed vector id {}. Lifecycle complete.", self.shard_id, dummy_id);
+        
         if let Some(lease) = self.active_leases[idx].take() {
             self.pool.release(lease);
         }
-        
-        // In a real scenario, we would now send the ACK back to the client.
-        info!("Shard {} command lifecycle complete.", self.shard_id);
     }
 }
