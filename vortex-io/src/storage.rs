@@ -28,6 +28,17 @@ impl DirectFile {
         self.fd
     }
 
+    /// Returns the current size of the underlying file.
+    pub fn file_size(&self) -> std::io::Result<u64> {
+        self._file.metadata().map(|m| m.len())
+    }
+
+    /// Truncates the file to a specific size.
+    /// Used during recovery to prune corrupted tails.
+    pub fn truncate(&self, size: u64) -> std::io::Result<()> {
+        self._file.set_len(size)
+    }
+
     /// Prepare a Write SQE. Buffer MUST be page-aligned (Constitution Rule 9)
     pub fn write_sqe(&self, buf: *const u8, len: u32, offset: u64, user_data: u64) -> io_uring::squeue::Entry {
         opcode::Write::new(types::Fd(self.fd), buf, len)

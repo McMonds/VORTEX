@@ -56,3 +56,22 @@ pub fn verify_header(bytes: &[u8]) -> Result<&RequestHeader, &'static str> {
 
     Ok(header)
 }
+
+/// Response Status: Success
+pub const STATUS_OK: u8 = 0;
+/// Response Status: General Error
+pub const STATUS_ERR: u8 = 1;
+
+/// The strict layout of the VORTEX Binary Protocol Response Header.
+/// Matches RequestHeader size (16 bytes) for symmetry.
+/// Replaces `version` with `status`.
+#[repr(C)]
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
+#[archive_attr(derive(CheckBytes, Debug))]
+pub struct ResponseHeader {
+    pub magic: u16,
+    pub status: u8,
+    pub opcode: u8,
+    pub payload_len: u32,
+    pub request_id: u64,
+}

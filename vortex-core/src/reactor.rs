@@ -4,15 +4,18 @@ use vortex_io::net::VortexListener;
 use crate::storage::wal::WalManager;
 use crate::index::hnsw::HnswIndex;
 use crate::index::VectorIndex;
-use vortex_rpc::VBP_MAGIC;
+use vortex_rpc::{VBP_MAGIC, ResponseHeader, STATUS_OK, STATUS_ERR};
 use log::{info, error, debug, trace};
 use io_uring::{opcode, types};
 use std::os::unix::io::RawFd;
+use std::time::Instant;
+use std::path::Path;
 
 /// User Data Tags to distinguish CQE types
 const TAG_ACCEPT: u64 = 0xFFFF_0000;
 const TAG_READ_PREFIX: u64 = 0xAAAA_0000;
 const TAG_WAL_PREFIX: u64 = 0xBBBB_0000;
+const TAG_WRITE_PREFIX: u64 = 0xCCCC_0000;
 
 const CMD_UPSERT: u8 = 1;
 const CMD_SEARCH: u8 = 5;
@@ -27,6 +30,8 @@ pub struct ShardReactor {
     index: HnswIndex,
     pending_submissions: u32,
     active_leases: Vec<Option<vortex_io::memory::BufferLease>>,
+    // Map Lease Index -> Socket FD for zero-copy response
+    active_fds: Vec<Option<RawFd>>,
     
     // Zero-Allocation Recycled Buffers
     completions_buffer: Vec<(u64, i32)>,
@@ -39,10 +44,62 @@ impl ShardReactor {
         let pool = BufferPool::new(ring_entries as usize, 4096);
         
         // Initialize WAL in current directory for now
-        let wal = WalManager::new(shard_id, ".").expect("Failed to init WAL");
+        let mut wal = WalManager::new(shard_id, ".").expect("Failed to init WAL");
         
         // Default dimension 128 for Milestone 5
-        let index = HnswIndex::new(128, 1_000_000);
+        let mut index = HnswIndex::new(128, 1_000_000);
+
+        // --- THE RESURRECTION (Phase 4 Recovery) ---
+        let wal_path = format!("./shard_{}.wal", shard_id);
+        let start_time = Instant::now();
+        let mut recovered_count = 0;
+
+        if Path::new(&wal_path).exists() {
+            // Replay iterator performs blocking I/O (allowed during boot per Rule #8 exception)
+            if let Ok(mut iter) = wal.replay_iter(&wal_path) {
+                for entry_res in &mut iter {
+                    match entry_res {
+                        Ok(entry) => {
+                            if entry.header.opcode == CMD_UPSERT {
+                                let payload = &entry.payload;
+                                if payload.len() >= 8 {
+                                    // Parse ID (8 bytes)
+                                    let id = u64::from_le_bytes(payload[0..8].try_into().unwrap_or([0; 8]));
+                                    // Parse Vector
+                                    let vec_bytes = &payload[8..];
+                                    let dim = vec_bytes.len() / 4;
+                                    if dim > 0 {
+                                        // SAFETY: WAL content is trusted for replay. Aligned in 4KB pages.
+                                        let vec_slice: &[f32] = unsafe {
+                                            std::slice::from_raw_parts(vec_bytes.as_ptr() as *const f32, dim)
+                                        };
+                                        index.insert(id, vec_slice);
+                                        recovered_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let corruption_offset = iter.bytes_read();
+                            error!("Shard {}: WAL Replay encountered corruption at offset {}: {}. Truncating log to prune corrupted tail.", 
+                                shard_id, corruption_offset, e);
+                            
+                            // Self-Healing: Truncate the file to the last known good position
+                            if let Err(te) = wal.truncate(corruption_offset) {
+                                error!("Shard {}: Failed to truncate corrupted WAL: {}", shard_id, te);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let duration = start_time.elapsed();
+        if recovered_count > 0 {
+            info!("Shard {}: Recovered {} records from WAL in {} ms.", 
+                shard_id, recovered_count, duration.as_millis());
+        }
 
         Self {
             shard_id,
@@ -53,6 +110,7 @@ impl ShardReactor {
             index,
             pending_submissions: 0,
             active_leases: vec![None; ring_entries as usize],
+            active_fds: vec![None; ring_entries as usize],
             
             // Pre-allocate to avoid malloc in hot loop
             completions_buffer: Vec::with_capacity(64),
@@ -132,6 +190,9 @@ impl ShardReactor {
             } else if (tag & 0xFFFF_0000) == TAG_WAL_PREFIX {
                 let idx = (tag & 0x0000_FFFF) as usize;
                 self.handle_wal_complete(idx, result as usize);
+            } else if (tag & 0xFFFF_0000) == TAG_WRITE_PREFIX {
+                let idx = (tag & 0x0000_FFFF) as usize;
+                self.handle_write_complete(idx, result as usize);
             }
         }
         
@@ -151,71 +212,232 @@ impl ShardReactor {
 
             self.push_submission(&read_e);
             self.active_leases[idx] = Some(lease);
+            self.active_fds[idx] = Some(fd);
         }
     }
 
-    fn handle_ingress_complete(&mut self, idx: usize, bytes: usize) {
-        if bytes < 16 { return; }
-        
+    /// Formats the response buffer using the *same* lease (Zero-Copy recycle).
+    fn prepare_response_buffer(&mut self, idx: usize, opcode: u8, status: u8, req_id: u64) {
         let page = self.pool.get_page_mut(idx);
         let data = page.as_slice_mut();
         
-        if u16::from_le_bytes([data[0], data[1]]) != VBP_MAGIC {
+        let header = ResponseHeader {
+            magic: VBP_MAGIC,
+            status,
+            opcode,
+            payload_len: 0, // 0 For now (Ack only)
+            request_id: req_id,
+        };
+        
+        // SAFETY: ResponseHeader is #[repr(C)] fixed size.
+        unsafe {
+            let ptr = data.as_mut_ptr() as *mut ResponseHeader;
+            *ptr = header;
+        }
+    }
+
+    /// Submits a write to the socket.
+    /// We reuse the ingress FD which implies we need to track it.
+    /// WAIT: In the current accept loop, we don't store the FD in the lease/struct!
+    /// We only passed it via 'result' in completions.
+    /// FIX: We need to store the socket FD in the active_leases or similar map?
+    /// OR: We assume the FD is stable? No, we need it.
+    /// 
+    /// For Phase 3, we must store the FD.
+    /// Current `active_leases` is just `Option<BufferLease>`.
+    /// 
+    /// STRATEGY UPDATE: The `TAG` encodes the index. We need a map of `Index -> FD`.
+    /// Or we can hack it: The FD is lost after Read submit if we don't save it.
+    ///
+    /// Let's check `submit_read`. It takes `fd`.
+    /// We need to store `fd` when we submit_read.
+    /// `active_leases` should be tuple `(Lease, Fd)`.
+    /// 
+    /// BUT for this atomic step, I'll update `active_leases` to store metadata?
+    /// Or add `fds: Vec<RawFd>` parallel array.
+    /// 
+    /// Let's add `active_fds: Vec<Option<RawFd>>` to ShardReactor struct.
+    fn submit_write(&mut self, idx: usize) {
+        let fd = self.active_fds[idx].expect("Lost FD for active lease!");
+        let page = self.pool.get_page_mut(idx);
+        let buf = page.as_slice_mut();
+        
+        // We only write the header (16 bytes) for now since payload_len=0.
+        let write_len = std::mem::size_of::<ResponseHeader>();
+        
+        let tag = TAG_WRITE_PREFIX | (idx as u64);
+        let write_e = opcode::Write::new(types::Fd(fd), buf.as_ptr(), write_len as u32)
+            .build()
+            .user_data(tag);
+            
+         self.push_submission(&write_e);
+    }
+
+    fn handle_ingress_complete(&mut self, idx: usize, bytes: usize) {
+        // 1. Handle Client Death (EOF)
+        if bytes == 0 {
+            trace!("Shard {} Ingress -> Client disconnected (EOF). Releasing lease.", self.shard_id);
+            if let Some(lease) = self.active_leases[idx].take() {
+                self.pool.release(lease);
+            }
             return;
         }
 
-        let cmd_code = data[3];
+        // 2. Protocol Guard (The Firewall)
+        // Check minimum size: Must be at least a Header.
+        if bytes < std::mem::size_of::<vortex_rpc::RequestHeader>() {
+            error!("Shard {} Ingress -> Protocol Violation: Packet too short ({} bytes). Dropping.", self.shard_id, bytes);
+            if let Some(lease) = self.active_leases[idx].take() {
+                self.pool.release(lease);
+            }
+            return;
+        }
         
-        // Rule 6: Linear Control Flow. Switch on opcode.
-        match cmd_code {
+        // 3. Cast & Check (The Contract) - SCOPED BORROW
+        // We extract the metadata and pointer efficiently to drop the borrow on self.pool
+        let (opcode, req_id, data_ptr) = {
+            let page = self.pool.get_page_mut(idx);
+            let data = page.as_slice_mut();
+            
+            match vortex_rpc::verify_header(&data[0..bytes]) {
+                Ok(h) => {
+                    info!("Shard {} Valid Packet: Opcode={}. (Magic: 0x{:x}, Len: {}).", 
+                        self.shard_id, h.opcode, h.magic, h.payload_len);
+                    (h.opcode, h.request_id, data.as_ptr())
+                },
+                Err(e) => {
+                    error!("Shard {} Ingress -> Protocol Violation: {}. Closing connection.", self.shard_id, e);
+                    // Strict firewall: Drop connection on Magic Mismatch
+                    // We need to return early, but we are inside a block.
+                    // We'll return a special tuple to signal exit.
+                    // 0 is invalid opcode.
+                    (0, 0, std::ptr::null())
+                }
+            }
+        };
+
+        // Handle Protocol Violation Exit
+        if data_ptr.is_null() {
+             if let Some(lease) = self.active_leases[idx].take() {
+                self.pool.release(lease);
+            }
+            return;
+        }
+
+        // 4. Decision Logic (Self is free now)
+        match opcode {
             CMD_SEARCH => {
                 // Rule 10: Speed over Durability for search. No WAL.
-                trace!("Shard {} Ingress -> Received SEARCH command.", self.shard_id);
+                info!("Shard {} Ingress -> Received SEARCH command (Log Only for Phase 2).", self.shard_id);
                 
                 // Zero-Allocation: Use scratch buffer
                 let results = self.index.search(self.scratch_query_buffer.as_slice(), 10);
                 debug!("Shard {} SEARCH complete. Found {} results.", self.shard_id, results.len());
                 
-                // Release lease since search is read-only
-                if let Some(lease) = self.active_leases[idx].take() {
-                    self.pool.release(lease);
-                }
+                // Phase 3 Target 2: Respond with Zero-Copy
+                // Reuse the same lease/buffer for the response
+                self.prepare_response_buffer(idx, CMD_SEARCH, STATUS_OK, req_id);
+                self.submit_write(idx);
             },
             CMD_UPSERT => {
                 // Rule 9: Persistence Precedes Response
-                trace!("Shard {} Ingress -> Submitting to WAL ({} bytes)", self.shard_id, bytes);
+                info!("Shard {} Ingress -> Submitting to WAL ({} bytes)", self.shard_id, bytes);
                 let tag = TAG_WAL_PREFIX | (idx as u64);
-                let wal_e = self.wal.write_entry(data.as_ptr(), 4096, tag);
-                
+                // Note: We write the FULL packet (Header + Payload) to the WAL for perfect reconstruction.
+                // We use the 'bytes' read from the socket (captured in arg), and data_ptr we extracted.
+                let wal_e = self.wal.write_entry(data_ptr, bytes as u32, tag);
                 self.push_submission(&wal_e);
             },
             _ => {
-                debug!("Shard {} Ingress -> Unknown command {}", self.shard_id, cmd_code);
+                debug!("Shard {} Ingress -> Unknown command {}", self.shard_id, opcode);
                 // In production, we should write an error response.
-                if let Some(lease) = self.active_leases[idx].take() {
-                    self.pool.release(lease);
-                }
+                self.prepare_response_buffer(idx, opcode, STATUS_ERR, req_id);
+                self.submit_write(idx);
             }
         }
     }
 
     fn handle_wal_complete(&mut self, idx: usize, bytes: usize) {
-        trace!("Shard {} WAL Persisted ({} bytes). Finalizing command.", self.shard_id, bytes);
+        info!("Shard {} WAL Persisted ({} bytes). Finalizing command.", self.shard_id, bytes);
         
-        // Finalizing: Indexing after persistence (Milestone 5)
+        // 1. Retrieve Payload
+        // The buffer contains [RequestHeader (16b)] [ID (8b)] [Vector (N * 4b)]
         let page = self.pool.get_page_mut(idx);
-        let _data = page.as_slice_mut();
+        let data = page.as_slice_mut();
         
-        // In a real VBP packet, we would extract the vector here.
-        // For demonstration, we'll index a dummy vector.
-        let dummy_id = 999;
-        // Use scratch buffer for insertion simulation too to avoid alloc
-        self.index.insert(dummy_id, self.scratch_query_buffer.as_slice());
+        let header_size = std::mem::size_of::<vortex_rpc::RequestHeader>();
         
-        trace!("Shard {} indexed vector id {}. Lifecycle complete.", self.shard_id, dummy_id);
+        // Safety Check (Protocol Guard II)
+        if bytes < header_size + 8 {
+             error!("Shard {} WAL Complete: Payload too short for Vector ID.", self.shard_id);
+             self.prepare_response_buffer(idx, CMD_UPSERT, STATUS_ERR, 0);
+             self.submit_write(idx);
+             return;
+        }
+
+        // 2. Parse ID and Vector
+        // We use unsafe cast for zero-copy parsing or aligned reads.
+        // Data is aligned to 4096, so offset 16 is aligned for u64 (8) and f32 (4).
+        let payload_ptr = unsafe { data.as_ptr().add(header_size) };
         
+        // Parse ID (8 bytes)
+        let id = unsafe { *(payload_ptr as *const u64) };
+        
+        // Parse Vector
+        // Remaining bytes = bytes - header - id
+        let vec_bytes = bytes - header_size - 8;
+        let dim = vec_bytes / 4;
+        
+        if dim == 0 {
+             error!("Shard {} WAL Complete: Vector dimension is 0.", self.shard_id);
+             self.prepare_response_buffer(idx, CMD_UPSERT, STATUS_ERR, 0);
+             self.submit_write(idx);
+             return;
+        }
+
+        let vector_slice = unsafe {
+            std::slice::from_raw_parts(payload_ptr.add(8) as *const f32, dim)
+        };
+        
+        // 3. Insert into Index
+        // This is the "Brain Transplant" moment.
+        self.index.insert(id, vector_slice);
+        
+        trace!("Shard {} indexed vector id {} (Dim: {}). Lifecycle complete.", self.shard_id, id, dim);
+        
+        // 4. Send Response (Closing the Circuit)
+        // We need the original Request ID.
+        // It's still in the buffer header!
+        let req_id = match vortex_rpc::verify_header(&data[0..16]) {
+            Ok(h) => h.request_id,
+            Err(_) => 0,
+        };
+        
+        self.prepare_response_buffer(idx, CMD_UPSERT, STATUS_OK, req_id);
+        self.submit_write(idx);
+        
+        // CRITICAL: Do NOT drop lease here. 
+        // Logic flows to handle_write_complete.
+    }
+    
+    fn handle_write_complete(&mut self, idx: usize, _res: usize) {
+        trace!("Shard {} Egress -> Response sent. Recycling lease.", self.shard_id);
+        
+        // CRITICAL FIX: Retrieve FD BEFORE clearing it
+        // We need to re-arm the connection for the next request (keep-alive)
+        let fd = self.active_fds[idx];
+        
+        // Release the current lease (response buffer is done)
         if let Some(lease) = self.active_leases[idx].take() {
             self.pool.release(lease);
+        }
+        self.active_fds[idx] = None;
+        
+        // Re-arm the Reader (The Keep-Alive Loop Fix)
+        // Submit a new read on the same FD to handle the next request
+        if let Some(fd) = fd {
+            trace!("Shard {} Re-arming connection (fd: {}) for next request.", self.shard_id, fd);
+            self.submit_read(fd);
         }
     }
 }

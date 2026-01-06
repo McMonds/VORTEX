@@ -1,42 +1,82 @@
-use std::io::Write;
+use std::io::{Write, Read};
 use std::net::TcpStream;
 use std::mem;
-use vortex_rpc::{RequestHeader, VBP_MAGIC, OP_UPSERT};
+use vortex_rpc::{RequestHeader, VBP_MAGIC, OP_UPSERT, OP_SEARCH};
 
+/// Pulse Check: Resurrection Edition
 fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let search_only = args.contains(&"--search-only".to_string());
+
     let addr = "127.0.0.1:9000";
     println!("Connecting to VORTEX at {}...", addr);
     let mut stream = TcpStream::connect(addr)?;
 
-    println!("Connected. Constructing VBP Upsert Packet...");
+    if !search_only {
+        println!("Connected. Constructing VBP Upsert Packet (128-dim Vector)...");
 
-    // 4 bytes payload: 0xDE, 0xAD, 0xBE, 0xEF
-    let payload = [0xDE, 0xAD, 0xBE, 0xEF];
-    
-    let header = RequestHeader {
+        // Payload: [ID (8 bytes)] + [Vector (128 * 4 = 512 bytes)]
+        let id: u64 = 101;
+        let vector: Vec<f32> = vec![0.1; 128]; 
+        let mut payload = Vec::with_capacity(8 + 512);
+        
+        payload.extend_from_slice(&id.to_le_bytes());
+        for val in &vector {
+            payload.extend_from_slice(&val.to_le_bytes());
+        }
+        
+        let header = RequestHeader {
+            magic: VBP_MAGIC,
+            version: 1,
+            opcode: OP_UPSERT,
+            payload_len: payload.len() as u32,
+            request_id: 1,
+        };
+
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &header as *const RequestHeader as *const u8,
+                mem::size_of::<RequestHeader>()
+            )
+        };
+
+        let mut packet = Vec::with_capacity(header_bytes.len() + payload.len());
+        packet.extend_from_slice(header_bytes);
+        packet.extend_from_slice(&payload);
+
+        println!("Sending VBP Packet ({} bytes)...", packet.len());
+        stream.write_all(&packet)?;
+        stream.flush()?;
+
+        println!("Waiting for ACK...");
+        let mut response = [0u8; 16]; 
+        stream.read_exact(&mut response)?;
+        println!("Response Received: {:?}", response);
+    } else {
+        println!("Search-Only Mode Active (Skipping UPSERT)...");
+    }
+
+    println!("Sending SEARCH Packet...");
+    let header_search = RequestHeader {
         magic: VBP_MAGIC,
         version: 1,
-        opcode: OP_UPSERT,
-        payload_len: payload.len() as u32,
-        request_id: 1,
+        opcode: OP_SEARCH,
+        payload_len: 0, 
+        request_id: 2,
     };
-
-    // Serialize Header (Raw C-Layout)
-    // SAFETY: RequestHeader is #[repr(C)] (Strict Layout) and contains only POD types. 
-    // We cast it to a byte slice to send over the wire. This is the definition of "The Contract".
-    let header_bytes = unsafe {
+    let header_bytes_search = unsafe {
         std::slice::from_raw_parts(
-            &header as *const RequestHeader as *const u8,
+            &header_search as *const RequestHeader as *const u8,
             mem::size_of::<RequestHeader>()
         )
     };
-
-    println!("Sending Header ({} bytes) + Payload ({} bytes)...", header_bytes.len(), payload.len());
-    
-    stream.write_all(header_bytes)?;
-    stream.write_all(&payload)?;
+    stream.write_all(header_bytes_search)?;
     stream.flush()?;
+    
+    let mut response_search = [0u8; 16];
+    stream.read_exact(&mut response_search)?;
+    println!("Search Response Received: {:?}", response_search);
 
-    println!("Probe dispatched successfully.");
+    println!("Probe Sequence Complete.");
     Ok(())
 }

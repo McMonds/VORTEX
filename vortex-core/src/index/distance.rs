@@ -45,3 +45,20 @@ unsafe fn l2_distance_avx2(v1: &[f32], v2: &[f32]) -> f32 {
     
     sum
 }
+
+/// Cosine Similarity (DotProduct / (NormA * NormB))
+/// Range: [-1.0, 1.0]
+#[inline]
+pub fn cosine_similarity(v1: &[f32], v2: &[f32]) -> f32 {
+    // Scalar implementation for baseline verification.
+    // In production, we would use AVX2 FMA (Fused Multiply Add).
+    let dot_product: f32 = v1.iter().zip(v2.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = v1.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = v2.iter().map(|x| x * x).sum::<f32>().sqrt();
+    
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+    
+    dot_product / (norm_a * norm_b)
+}
