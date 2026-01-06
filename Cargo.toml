@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "vortex-core",
+    "vortex-io",
+    "vortex-server",
+    "vortex-rpc",
+]
+resolver = "2"

@@ -1,0 +1,10 @@
+[package]
+name = "vortex-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vortex-rpc = { path = "../vortex-rpc" }
+rkyv = { version = "0.7", features = ["validation"] }
+log = "0.4"
+crossbeam-utils = "0.8"

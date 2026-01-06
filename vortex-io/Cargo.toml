@@ -1,0 +1,12 @@
+[package]
+name = "vortex-io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+io-uring = "0.6"
+core_affinity = "0.8"
+nix = { version = "0.27", features = ["sched", "mman"] }
+libc = "0.2"
+hwloc2 = "2.2.0"
+log = "0.4"

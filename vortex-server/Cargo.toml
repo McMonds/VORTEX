@@ -1,0 +1,10 @@
+[package]
+name = "vortex-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vortex-io = { path = "../vortex-io" }
+vortex-core = { path = "../vortex-core" }
+log = "0.4"
+env_logger = "0.10"
