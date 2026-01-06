@@ -1,40 +1,58 @@
 use rkyv::{Archive, Deserialize, Serialize};
+use bytecheck::CheckBytes;
 
-/// VORTEX Binary Protocol (VBP) Header
-/// Fixed 16-byte header for SIMD alignment.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy)]
-#[archive(check_bytes)]
-#[repr(C, align(16))]
-pub struct VbpHeader {
-    pub magic: u16,        // 0x5658 (VX)
-    pub version: u8,
-    pub command_code: u8,
-    pub correlation_id: u32,
-    pub payload_len: u32,
-    pub flags: u32,
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[archive(check_bytes)]
-#[repr(u8)]
-pub enum Command {
-    Ping = 0,
-    Upsert = 1,
-    Query = 2,
-    Delete = 3,
-    Stats = 4,
-    Search = 5,
-}
-
-/// Example Payload for Vector Upsert
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
-#[archive(check_bytes)]
-#[repr(C, align(64))]
-pub struct UpsertRequest {
-    pub vector_id: u64,
-    pub dimension: u32,
-    pub embedding: Vec<f32>,
-}
-
+/// 'VX' in ASCII hex. Used to identify VORTEX Binary Protocol packets.
 pub const VBP_MAGIC: u16 = 0x5658;
-pub const VBP_VERSION: u8 = 1;
+
+/// Opcode for inserting or updating a vector.
+pub const OP_UPSERT: u8 = 1;
+
+/// Opcode for searching nearest neighbors.
+pub const OP_SEARCH: u8 = 5;
+
+/// The strict layout of the VORTEX Binary Protocol Header.
+/// 
+/// # Layout (C-Compatible)
+/// - `magic` (2 bytes): Must be `0x5658`.
+/// - `version` (1 byte): Protocol version (currently 1).
+/// - `opcode` (1 byte): Command type (1=Upsert, 5=Search).
+/// - `payload_len` (4 bytes): Length of the following payload body.
+/// - `request_id` (8 bytes): Client-generated correlation ID.
+/// 
+/// # Alignment
+/// This struct uses `#[repr(C)]`. The natural alignment of fields matches the packed layout perfectly
+/// (2+1+1 = 4 bytes offset for u32, 4+4 = 8 bytes offset for u64).
+/// This avoids "reference to packed field" errors in Rust while maintaining the exact binary layout.
+#[repr(C)]
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Copy)]
+#[archive_attr(derive(CheckBytes, Debug))]
+pub struct RequestHeader {
+    pub magic: u16,
+    pub version: u8,
+    pub opcode: u8,
+    pub payload_len: u32,
+    pub request_id: u64,
+}
+
+/// Safely casts a byte slice to a RequestHeader and validates the magic number.
+///
+/// # Errors
+/// Returns an error if the slice is too short or the magic number is invalid.
+///
+/// # Safety
+/// This function handles the unsafe pointer cast internally and verifies bounds.
+pub fn verify_header(bytes: &[u8]) -> Result<&RequestHeader, &'static str> {
+    if bytes.len() < std::mem::size_of::<RequestHeader>() {
+        return Err("Packet too short for VBP Header");
+    }
+
+    // SAFETY: We checked the length above. The struct is POD (Archive+Copy+C-Repr).
+    // The pointer cast is valid for reading raw bytes as the struct.
+    let header = unsafe { &*(bytes.as_ptr() as *const RequestHeader) };
+
+    if header.magic != VBP_MAGIC {
+        return Err("Invalid Magic Number");
+    }
+
+    Ok(header)
+}

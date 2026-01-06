@@ -14,6 +14,10 @@ impl RingDriver {
         self.ring.submit_and_wait(want)
     }
 
+    pub fn submit(&mut self) -> std::io::Result<usize> {
+        self.ring.submit()
+    }
+
     pub fn completion_queue(&mut self) -> cqueue::CompletionQueue<'_> {
         self.ring.completion()
     }

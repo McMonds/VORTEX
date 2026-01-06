@@ -1,66 +1,70 @@
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::net::{Ipv4Addr, SocketAddr};
 use io_uring::{opcode, types};
+use socket2::{Socket, Domain, Type, Protocol};
 use log::info;
-use std::net::ToSocketAddrs;
 
+/// VORTEX TCP Ingress Listener.
+/// Uses socket2 for safe hardware-level configuration (REUSEPORT, NODELAY).
 pub struct VortexListener {
-    fd: RawFd,
+    socket: Socket,
 }
 
 impl VortexListener {
-    pub fn bind(addr: &str) -> std::io::Result<Self> {
-        let socket_addr = addr.to_socket_addrs()?.next().ok_or(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address"))?;
+    /// Creates a new high-performance ingress listener for the VBP protocol.
+    /// 
+    /// # Performance
+    /// - Enables `SO_REUSEPORT` for linear multi-core scaling.
+    /// - Enables `TCP_NODELAY` to minimize latency for small vector packets.
+    /// - Sets `O_NONBLOCK` for compatibility with `io_uring`.
+    /// 
+    /// # Errors
+    /// Returns `std::io::Error` if the socket cannot be created, configured, or bound.
+    pub fn new_ingress(port: u16) -> std::io::Result<Self> {
+        let domain = Domain::IPV4;
+        let socket_type = Type::STREAM;
+        let protocol = Some(Protocol::TCP);
+
+        let socket = Socket::new(domain, socket_type, protocol)?;
+
+        // Performance & Clustering Configuration
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+        socket.set_nodelay(true)?;
+        socket.set_nonblocking(true)?;
+
+        // Bind to all interfaces (Global Ingress)
+        let addr = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), port);
+        socket.bind(&addr.into())?;
+
+        // Listen with production-grade backlog
+        const LISTEN_BACKLOG: i32 = 4096;
+        socket.listen(LISTEN_BACKLOG)?;
+
+        info!("VBP Ingress active on port {} (fd: {}) [REUSEPORT=ON, NODELAY=ON]", port, socket.as_raw_fd());
         
-        unsafe {
-            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-            if fd < 0 { return Err(std::io::Error::last_os_error()); }
-
-            // Enable SO_REUSEADDR and SO_REUSEPORT
-            let optval: libc::c_int = 1;
-            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &optval as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &optval as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-
-            // Bind
-            let mut sockaddr_in: libc::sockaddr_in = std::mem::zeroed();
-            sockaddr_in.sin_family = libc::AF_INET as libc::sa_family_t;
-            sockaddr_in.sin_port = socket_addr.port().to_be();
-            match socket_addr.ip() {
-                std::net::IpAddr::V4(v4) => {
-                    sockaddr_in.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
-                }
-                _ => return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "IPv6 not supported in Milestone 6")),
-            }
-
-            if libc::bind(fd, &sockaddr_in as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t) < 0 {
-                let err = std::io::Error::last_os_error();
-                libc::close(fd);
-                return Err(err);
-            }
-
-            // Listen
-            if libc::listen(fd, 128) < 0 {
-                let err = std::io::Error::last_os_error();
-                libc::close(fd);
-                return Err(err);
-            }
-
-            // Non-blocking
-            let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-
-            info!("VBP Listener bound to {} (fd: {}) with HARDWARE REUSEPORT", addr, fd);
-            Ok(Self { fd })
-        }
+        Ok(Self { socket })
     }
 
-    pub fn fd(&self) -> RawFd {
-        self.fd
+    /// Exposes the raw file descriptor for the io_uring submission queue.
+    #[inline]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
     }
 
-    /// Prepare an Accept SQE for io_uring
-    pub fn accept_sqe(&self, addr: *mut libc::sockaddr, addrlen: *mut libc::socklen_t, user_data: u64) -> io_uring::squeue::Entry {
-        opcode::Accept::new(types::Fd(self.fd), addr, addrlen)
+    /// Generates an io_uring Accept SQE for this listener.
+    /// 
+    /// # SAFETY
+    /// The caller must ensure `addr` and `addrlen` are valid pointers or null.
+    pub fn accept_sqe(&self, addr: *mut libc::sockaddr, addrlen: *mut libc::socklen_t, tag: u64) -> io_uring::squeue::Entry {
+        opcode::Accept::new(types::Fd(self.as_raw_fd()), addr, addrlen)
             .build()
-            .user_data(user_data)
+            .user_data(tag)
+    }
+}
+
+impl AsRawFd for VortexListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_raw_fd()
     }
 }

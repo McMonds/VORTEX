@@ -5,7 +5,7 @@ use crate::storage::wal::WalManager;
 use crate::index::hnsw::HnswIndex;
 use crate::index::VectorIndex;
 use vortex_rpc::VBP_MAGIC;
-use log::{info, error};
+use log::{info, error, debug, trace};
 use io_uring::{opcode, types};
 use std::os::unix::io::RawFd;
 
@@ -13,6 +13,9 @@ use std::os::unix::io::RawFd;
 const TAG_ACCEPT: u64 = 0xFFFF_0000;
 const TAG_READ_PREFIX: u64 = 0xAAAA_0000;
 const TAG_WAL_PREFIX: u64 = 0xBBBB_0000;
+
+const CMD_UPSERT: u8 = 1;
+const CMD_SEARCH: u8 = 5;
 
 pub struct ShardReactor {
     shard_id: usize,
@@ -24,6 +27,10 @@ pub struct ShardReactor {
     index: HnswIndex,
     pending_submissions: u32,
     active_leases: Vec<Option<vortex_io::memory::BufferLease>>,
+    
+    // Zero-Allocation Recycled Buffers
+    completions_buffer: Vec<(u64, i32)>,
+    scratch_query_buffer: Box<[f32; 128]>,
 }
 
 impl ShardReactor {
@@ -46,42 +53,68 @@ impl ShardReactor {
             index,
             pending_submissions: 0,
             active_leases: vec![None; ring_entries as usize],
+            
+            // Pre-allocate to avoid malloc in hot loop
+            completions_buffer: Vec::with_capacity(64),
+            scratch_query_buffer: Box::new([0.0f32; 128]),
         }
     }
 
-    pub fn listen(&mut self, addr: &str) -> std::io::Result<()> {
-        let listener = VortexListener::bind(addr)?;
+    pub fn listen(&mut self, port: u16) -> std::io::Result<()> {
+        let listener = VortexListener::new_ingress(port)?;
         self.listener = Some(listener);
         self.submit_accept();
         Ok(())
     }
 
+    /// Helper to submit an SQE with Backpressure handling.
+    /// If the ring is full, it busy-loops on submit() until space opens up.
+    fn push_submission(&mut self, entry: &io_uring::squeue::Entry) {
+        loop {
+            // SAFETY: Checked push to pre-allocated ring buffer. Entry is valid.
+            unsafe {
+                if self.ring.submission_queue().push(entry).is_ok() {
+                    self.pending_submissions += 1;
+                    return;
+                }
+            }
+
+            // Backpressure Strategy: Flush to kernel to free up SQ slots.
+            if let Err(e) = self.ring.submit() {
+                error!("Critical Ring Submit Error during backpressure flush: {}", e);
+            }
+        }
+    }
+
     fn submit_accept(&mut self) {
         if let Some(ref listener) = self.listener {
             let entry = listener.accept_sqe(std::ptr::null_mut(), std::ptr::null_mut(), TAG_ACCEPT);
-            unsafe {
-                self.ring.submission_queue().push(&entry).expect("Ring full");
-            }
-            self.pending_submissions += 1;
+            self.push_submission(&entry);
         }
     }
 
     pub fn run_tick(&mut self) -> bool {
+        // Opportunistic submit of any pending SQEs
         if let Err(e) = self.ring.submit_and_wait(1) {
             error!("Shard {} Ring Error: {}", self.shard_id, e);
             return false;
         }
 
-        let mut completions = Vec::with_capacity(64);
+        // Reuse the completions buffer (Zero Allocation)
+        self.completions_buffer.clear();
+        
         {
             let mut cq = self.ring.completion_queue();
             while let Some(cqe) = cq.next() {
                 self.pending_submissions -= 1;
-                completions.push((cqe.user_data() as u64, cqe.result()));
+                self.completions_buffer.push((cqe.user_data() as u64, cqe.result()));
             }
         }
 
-        for (tag, result) in completions {
+        // Iterate over the buffer (borrow checker happy now)
+        for i in 0..self.completions_buffer.len() {
+            let (tag, result) = self.completions_buffer[i];
+            
             if result < 0 {
                 let err = std::io::Error::from_raw_os_error(-result);
                 if err.kind() == std::io::ErrorKind::WouldBlock { continue; }
@@ -116,11 +149,8 @@ impl ShardReactor {
                 .build()
                 .user_data(tag);
 
-            unsafe {
-                self.ring.submission_queue().push(&read_e).expect("Ring full");
-            }
+            self.push_submission(&read_e);
             self.active_leases[idx] = Some(lease);
-            self.pending_submissions += 1;
         }
     }
 
@@ -136,30 +166,41 @@ impl ShardReactor {
 
         let cmd_code = data[3];
         
-        if cmd_code == 5 { // Search (Rule 10: Speed over Durability for search)
-            info!("Shard {} Ingress -> Received SEARCH command.", self.shard_id);
-            let dummy_query = vec![0.1f32; 128];
-            let results = self.index.search(&dummy_query, 10);
-            info!("Shard {} SEARCH complete. Found {} results.", self.shard_id, results.len());
-            
-            // Release lease since search is read-only
-            if let Some(lease) = self.active_leases[idx].take() {
-                self.pool.release(lease);
+        // Rule 6: Linear Control Flow. Switch on opcode.
+        match cmd_code {
+            CMD_SEARCH => {
+                // Rule 10: Speed over Durability for search. No WAL.
+                trace!("Shard {} Ingress -> Received SEARCH command.", self.shard_id);
+                
+                // Zero-Allocation: Use scratch buffer
+                let results = self.index.search(self.scratch_query_buffer.as_slice(), 10);
+                debug!("Shard {} SEARCH complete. Found {} results.", self.shard_id, results.len());
+                
+                // Release lease since search is read-only
+                if let Some(lease) = self.active_leases[idx].take() {
+                    self.pool.release(lease);
+                }
+            },
+            CMD_UPSERT => {
+                // Rule 9: Persistence Precedes Response
+                trace!("Shard {} Ingress -> Submitting to WAL ({} bytes)", self.shard_id, bytes);
+                let tag = TAG_WAL_PREFIX | (idx as u64);
+                let wal_e = self.wal.write_entry(data.as_ptr(), 4096, tag);
+                
+                self.push_submission(&wal_e);
+            },
+            _ => {
+                debug!("Shard {} Ingress -> Unknown command {}", self.shard_id, cmd_code);
+                // In production, we should write an error response.
+                if let Some(lease) = self.active_leases[idx].take() {
+                    self.pool.release(lease);
+                }
             }
-        } else { // Upsert or other (Rule 9: Persistence Precedes Response)
-            info!("Shard {} Ingress -> Submitting to WAL ({} bytes)", self.shard_id, bytes);
-            let tag = TAG_WAL_PREFIX | (idx as u64);
-            let wal_e = self.wal.write_entry(data.as_ptr(), 4096, tag);
-            
-            unsafe {
-                self.ring.submission_queue().push(&wal_e).expect("Ring full");
-            }
-            self.pending_submissions += 1;
         }
     }
 
     fn handle_wal_complete(&mut self, idx: usize, bytes: usize) {
-        info!("Shard {} WAL Persisted ({} bytes). Finalizing command.", self.shard_id, bytes);
+        trace!("Shard {} WAL Persisted ({} bytes). Finalizing command.", self.shard_id, bytes);
         
         // Finalizing: Indexing after persistence (Milestone 5)
         let page = self.pool.get_page_mut(idx);
@@ -168,10 +209,10 @@ impl ShardReactor {
         // In a real VBP packet, we would extract the vector here.
         // For demonstration, we'll index a dummy vector.
         let dummy_id = 999;
-        let dummy_vec = vec![0.1f32; 128];
-        self.index.insert(dummy_id, &dummy_vec);
+        // Use scratch buffer for insertion simulation too to avoid alloc
+        self.index.insert(dummy_id, self.scratch_query_buffer.as_slice());
         
-        info!("Shard {} indexed vector id {}. Lifecycle complete.", self.shard_id, dummy_id);
+        trace!("Shard {} indexed vector id {}. Lifecycle complete.", self.shard_id, dummy_id);
         
         if let Some(lease) = self.active_leases[idx].take() {
             self.pool.release(lease);
