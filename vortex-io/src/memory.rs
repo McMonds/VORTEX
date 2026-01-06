@@ -71,6 +71,7 @@ impl BufferPool {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct BufferLease {
     pub index: usize,
 }

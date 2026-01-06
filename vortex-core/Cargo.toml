@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 vortex-rpc = { path = "../vortex-rpc" }
+vortex-io = { path = "../vortex-io" }
+io-uring = "0.6"
 rkyv = { version = "0.7", features = ["validation"] }
 log = "0.4"
 crossbeam-utils = "0.8"

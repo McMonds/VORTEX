@@ -558,8 +558,10 @@ name = "vortex-core"
 version = "0.1.0"
 dependencies = [
  "crossbeam-utils",
+ "io-uring",
  "log",
  "rkyv",
+ "vortex-io",
  "vortex-rpc",
 ]
 
