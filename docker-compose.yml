@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  vortex-server:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/var/lib/vortex/data
+    cap_add:
+      - IPC_LOCK     # Required for memory pinning (mlockall)
+      - SYS_NICE     # Optional: allows thread priority/pinning optimizations
+    ulimits:
+      memlock: -1    # Required: remove memory locking limits for HugePages
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
