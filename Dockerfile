@@ -12,9 +12,8 @@ WORKDIR /usr/src/vortex
 COPY . .
 
 # Build for release
-# Note: VORTEX targets specific hardware features. 
-# For academic demonstration, we build with generic optimizations.
-RUN cargo build --release --bin vortex-server
+# We build both the server and the benchmark tools
+RUN cargo build --release --bin vortex-server --example vortex_stress
 
 # --- RUNTIME STAGE ---
 FROM debian:bookworm-slim
@@ -25,8 +24,9 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the binary from the builder stage
+# Copy binaries from the builder stage
 COPY --from=builder /usr/src/vortex/target/release/vortex-server /usr/local/bin/vortex-server
+COPY --from=builder /usr/src/vortex/target/release/examples/vortex_stress /usr/local/bin/vortex_stress
 
 # Create data directory for WAL
 RUN mkdir -p /var/lib/vortex/data

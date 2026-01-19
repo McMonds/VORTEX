@@ -51,12 +51,27 @@ docker-compose up --build -d
 ---
 
 ## 📡 Running the Benchmark
-Once the server is running, you can trigger the performance probe from the host machine:
+### 1. Launch the Server
+Open a terminal (PowerShell or Bash) and run:
+```bash
+docker-compose up --build -d
+```
+
+### 2. Generate Vectors & Benchmarking
+Since the Professor may not have Rust installed, we run the **Stress Test** directly inside a new container. This command will connect to the running server, generate 10,000 random vectors, and perform the search analysis:
 
 ```bash
-# Run 10,000 Vector Stress Test (Concurrency: 8)
-cargo run --example vortex_stress 10000 8
+docker run --rm --network host vortex-vortex-server vortex_stress 10000 8
 ```
+*(Note: `--network host` allows the client to reach the server on 127.0.0.1)*
+
+## 🪟 Windows Setup (Crucial)
+If your professor is on Windows, they MUST have:
+1. **Docker Desktop** installed.
+2. **WSL2 Backend** enabled (Settings > General > Use the WSL 2 based engine).
+3. VORTEX utilizes `io_uring`, which is a Linux-native kernel feature. Docker on Windows provides this by running a Linux VM in the background (WSL2).
+
+---
 
 ## 📜 The VORTEX "Constitution"
 All VORTEX code follows 5 non-negotiable laws:
