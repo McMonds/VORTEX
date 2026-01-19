@@ -1,6 +1,8 @@
 use crate::reactor::ShardReactor;
 use log::info;
 use std::thread;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_utils::sync::WaitGroup;
 
 /// ShardProxy: Orchestrates multiple ShardReactors across cores.
@@ -14,12 +16,18 @@ pub struct ShardProxy {
     num_shards: usize,
     max_elements_per_shard: usize,
     storage_dir: String,
+    running: Arc<AtomicBool>,
 }
 
 impl ShardProxy {
     /// Initializes a new Proxy orchestrator.
     pub fn new(num_shards: usize, max_elements_per_shard: usize, storage_dir: String) -> Self {
-        Self { num_shards, max_elements_per_shard, storage_dir }
+        Self { 
+            num_shards, 
+            max_elements_per_shard, 
+            storage_dir,
+            running: Arc::new(AtomicBool::new(true)),
+        }
     }
 
     /// Spawns and pins all Shard Reactor threads.
@@ -41,6 +49,7 @@ impl ShardProxy {
             let wg = wg.clone();
             let max_el = self.max_elements_per_shard;
             let dir = self.storage_dir.clone();
+            let running = self.running.clone();
 
             let result = thread::Builder::new()
                 .name(format!("shard_{}", shard_id))
@@ -53,7 +62,16 @@ impl ShardProxy {
                     }
                     info!("Shard {} Online (Threaded). Pinned to Core {}.", shard_id, shard_id);
                     drop(wg);
-                    loop { reactor.run_tick(); }
+                    
+                    while running.load(Ordering::SeqCst) {
+                        if !reactor.run_tick() { break; }
+                    }
+                    
+                    info!("Shard {} initiating graceful drain...", shard_id);
+                    reactor.shutdown();
+                    // One final tick to process the flush write
+                    reactor.run_tick();
+                    info!("Shard {} Offline.", shard_id);
                 });
             
             match result {
@@ -86,13 +104,19 @@ impl ShardProxy {
         info!("Cluster Orchestrator: All {} active shards online (Requested: {}).", actually_spawned + 1, self.num_shards);
 
         // Enter Main Loop for Shard N-1
-        loop {
-            reactor.run_tick();
+        while self.running.load(Ordering::SeqCst) {
+            if !reactor.run_tick() { break; }
         }
+        
+        info!("Shard {} (Main) initiating graceful drain...", main_shard_id);
+        reactor.shutdown();
+        reactor.run_tick();
+        info!("Shard {} (Main) Offline.", main_shard_id);
     }
 
     /// Signal a graceful shutdown to all shards.
     pub fn shutdown(&self) {
-        info!("Proxy -> signal sent to all shards (Stub: Simulated Graceful Shutdown).");
+        info!("Cluster Proxy: Shutdown signal propagated to all shards.");
+        self.running.store(false, Ordering::SeqCst);
     }
 }

@@ -11,3 +11,4 @@ rkyv = { version = "0.7", features = ["validation"] }
 log = "0.4"
 crossbeam-utils = "0.8"
 rand = "0.8"
+libc = "0.2"

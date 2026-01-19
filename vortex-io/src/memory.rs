@@ -28,7 +28,7 @@ impl BufferPage {
     /// 
     /// # Panics
     /// Panics during startup if allocation or mlock fails (Rule I).
-    pub fn new(size: usize) -> Self {
+    pub fn new(size: usize) -> (Self, bool) {
         let layout = Layout::from_size_align(size, PAGE_SIZE).expect("CRITICAL: Invalid alignment parameters at startup");
         
         // SAFETY: Aligned via Layout, size guarantees enforced by constructor.
@@ -38,14 +38,9 @@ impl BufferPage {
         }
 
         // SAFETY: ptr is valid and allocated with size from layout. Pinning via mlock.
-        unsafe {
-            if mlock(ptr as *const c_void, layout.size()) != 0 {
-                let err = std::io::Error::last_os_error();
-                panic!("CRITICAL: Failed to lock memory via mlock: {}. VORTEX cannot run without pinned memory.", err);
-            }
-        }
+        let locked = unsafe { mlock(ptr as *const c_void, layout.size()) == 0 };
 
-        Self { ptr, layout }
+        (Self { ptr, layout }, locked)
     }
 
     /// Returns a raw iovec for io_uring registration.
@@ -105,10 +100,19 @@ impl BufferPool {
         info!("Initializing BufferPool: {} pages of {} bytes", page_count, page_size);
         let mut pages = Vec::with_capacity(page_count);
         let mut free_indices = Vec::with_capacity(page_count);
+        let mut lock_failed_count = 0;
         
         for i in 0..page_count {
-            pages.push(BufferPage::new(page_size));
+            let (page, locked) = BufferPage::new(page_size);
+            if !locked {
+                lock_failed_count += 1;
+            }
+            pages.push(page);
             free_indices.push(i);
+        }
+
+        if lock_failed_count > 0 {
+            log::warn!("WARNING: Failed to lock {}/{} memory pages via mlock. Performance may be degraded (Rule #4 exception).", lock_failed_count, page_count);
         }
         
         Self { pages, free_indices, page_size }

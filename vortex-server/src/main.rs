@@ -60,6 +60,7 @@ fn main() -> Result<()> {
         warn!("============================================================");
         (1, CONSTRAINED_MAX_ELEMENTS)
     } else {
+        info!("Performance Tuning: Running in RELEASE mode is highly recommended for 20k+ ops/sec.");
         let s = args.shards.unwrap_or(detected_cores);
         let c = args.capacity.unwrap_or(if topology.is_constrained() { CONSTRAINED_MAX_ELEMENTS } else { DEFAULT_MAX_ELEMENTS });
         info!("Performance Scaling: {} Shards, {} Vector Capacity per shard.", s, c);
@@ -85,9 +86,6 @@ fn main() -> Result<()> {
         r.store(false, Ordering::SeqCst);
         p.shutdown();
         info!("Refusing new connections. Waiting for reactor convergence...");
-        // In a real system, we'd wait for a condvar or channel. 
-        // For now, we rely on the main loop to exit or the OS to kill us after cleanup.
-        std::process::exit(0);
     }).context("Error setting Ctrl-C handler")?;
 
     // 6. Spawn Shards

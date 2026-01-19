@@ -22,8 +22,13 @@ pub fn lock_memory_pages() {
     
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        log::warn!("WARNING: Failed to lock memory pages (mlockall): {}.", err);
-        log::warn!("Fix: Run 'ulimit -l unlimited' or run with capability CAP_IPC_LOCK.");
-        log::warn!("Continuing in constrained mode. SWAP may occur (Performance Degradation).");
+        log::error!("============================================================");
+        log::error!("CRITICAL PERFORMANCE WARNING: MLOCKALL FAILED ({})", err);
+        log::error!("Cause: System memory locking limits (ulimit -l) are too low.");
+        log::error!("Impact: VORTEX pages may be swapped to disk, causing 100x latency spikes.");
+        log::error!("FIX: Run 'ulimit -l unlimited' or add '* soft memlock unlimited' to /etc/security/limits.conf.");
+        log::error!("============================================================");
+    } else {
+        log::info!("Sytem-wide memory pinning (mlockall) successful.");
     }
 }

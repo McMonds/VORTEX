@@ -154,12 +154,27 @@ impl Iterator for WalIterator {
         }
 
         // 2. Parse Header
-        // SAFETY: RequestHeader is #[repr(C)] with fixed layout
+        // SAFETY: RequestHeader is #[repr(C)] fixed size
         let header = unsafe {
             std::ptr::read(header_buf.as_ptr() as *const vortex_rpc::RequestHeader)
         };
 
-        // 3. Validate Magic
+        // 3. SECTOR ALIGNMENT RECOVERY (BP Rule 12)
+        // If magic is 0, we hit padding. Jump to the next 4KB boundary.
+        if header.magic == 0 {
+            let next_page = (self.bytes_read + 4095) & !4095;
+            if next_page > self.bytes_read {
+                use std::io::Seek;
+                if let Err(e) = self.file.seek(std::io::SeekFrom::Start(next_page)) {
+                    return Some(Err(e));
+                }
+                self.bytes_read = next_page;
+                // Recursively call next to start from the fresh page
+                return self.next();
+            }
+        }
+
+        // 4. Validate Magic
         if header.magic != vortex_rpc::VBP_MAGIC {
             return Some(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

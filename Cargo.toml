@@ -4,5 +4,7 @@ members = [
     "vortex-io",
     "vortex-server",
     "vortex-rpc",
+    "benchmarks",
+    "vortex-dashboard",
 ]
 resolver = "2"

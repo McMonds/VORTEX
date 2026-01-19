@@ -9,6 +9,8 @@ pub struct DirectFile {
     fd: RawFd,
 }
 
+// [REMOVED] Unused AlignedPadding
+
 impl DirectFile {
     /// Open a file with O_DIRECT | O_DSYNC for kernel-bypass persistence (BP 10)
     pub fn open_wal(path: &str) -> std::io::Result<Self> {
@@ -39,7 +41,6 @@ impl DirectFile {
         self._file.set_len(size)
     }
 
-    /// Prepare a Write SQE. Buffer MUST be page-aligned (Constitution Rule 9)
     pub fn write_sqe(&self, buf: *const u8, len: u32, offset: u64, user_data: u64) -> io_uring::squeue::Entry {
         opcode::Write::new(types::Fd(self.fd), buf, len)
             .offset(offset)
