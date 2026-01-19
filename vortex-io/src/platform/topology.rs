@@ -4,7 +4,6 @@ use log::{warn, info};
 /// Identifies physical cores to enable accurate Shard-per-Core placement.
 pub struct SystemTopology {
     physical_cores: Vec<usize>,
-    total_ram: u64,
     available_ram: u64,
 }
 
@@ -40,7 +39,7 @@ impl SystemTopology {
             warn!("DANGER: Low memory environment detected (< 2GB available). Adaptive scaling required.");
         }
 
-        Self { physical_cores, total_ram, available_ram }
+        Self { physical_cores, available_ram }
     }
 
     /// Returns the IDs of available physical cores.

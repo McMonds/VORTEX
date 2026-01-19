@@ -183,7 +183,18 @@ impl Iterator for WalIterator {
 
         self.bytes_read += payload_len as u64;
 
-        // 5. Yield Entry
+        // 5. SECURE ALIGNMENT: Each WAL entry was written with O_DIRECT (aligned to 4KB).
+        // To read the NEXT entry, we must skip the padding by aligning bytes_read.
+        let next_aligned = (self.bytes_read + 4095) & !4095;
+        if next_aligned > self.bytes_read {
+            use std::io::Seek;
+            if let Err(e) = self.file.seek(std::io::SeekFrom::Start(next_aligned)) {
+                return Some(Err(e));
+            }
+            self.bytes_read = next_aligned;
+        }
+
+        // 6. Yield Entry
         Some(Ok(WalEntry { header, payload }))
     }
 }

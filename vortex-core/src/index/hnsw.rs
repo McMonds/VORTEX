@@ -1,7 +1,7 @@
 use crate::index::VectorIndex;
 use crate::index::simd;
 use super::quantization;
-use log::info;
+use log::{info, error};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::RwLock;
@@ -258,7 +258,11 @@ impl HnswIndex {
 
 impl VectorIndex for HnswIndex {
     fn insert(&mut self, id: u64, vector: &[f32]) {
-        assert_eq!(vector.len(), self.dimension, "Dimension Mismatch");
+        if vector.len() != self.dimension {
+            error!("Shard {} HNSW -> Dimension Mismatch (Expected {}, Got {}). Skipping insert to avoid panic.", 
+                "local", self.dimension, vector.len());
+            return;
+        }
         let mut arena = self.arena.write().unwrap();
         let mut map = self.map.write().unwrap();
         let mut external_ids = self.external_ids.write().unwrap();

@@ -18,7 +18,12 @@ fn main() -> std::io::Result<()> {
         // Payload: [ID (8 bytes)] + [Vector (128 * 4 = 512 bytes)]
         let id: u64 = 101;
         let vector: Vec<f32> = vec![0.1; 128]; 
-        let mut payload = Vec::with_capacity(8 + 512);
+        
+        // PADDING LOGIC: VORTEX Constitution Rule 9 requires 4KB alignment.
+        // Header (16) + ID (8) + Vector (128*4 = 512) = 536 bytes.
+        // We set payload_len to the LOGICAL size (ID + Vector).
+        let logical_payload_len = 8 + 512;
+        let mut payload = Vec::with_capacity(logical_payload_len);
         
         payload.extend_from_slice(&id.to_le_bytes());
         for val in &vector {
@@ -29,7 +34,7 @@ fn main() -> std::io::Result<()> {
             magic: VBP_MAGIC,
             version: 1,
             opcode: OP_UPSERT,
-            payload_len: payload.len() as u32,
+            payload_len: logical_payload_len as u32,
             request_id: 1,
         };
 
@@ -40,9 +45,13 @@ fn main() -> std::io::Result<()> {
             )
         };
 
-        let mut packet = Vec::with_capacity(header_bytes.len() + payload.len());
+        // We can still send 4096 bytes to ensure the server gets a full page if it wants,
+        // but the header will tell it how much to actually process.
+        let mut packet = Vec::with_capacity(4096);
         packet.extend_from_slice(header_bytes);
         packet.extend_from_slice(&payload);
+        let padding_needed = 4096 - packet.len();
+        packet.extend(std::iter::repeat(0u8).take(padding_needed));
 
         println!("Sending VBP Packet ({} bytes)...", packet.len());
         stream.write_all(&packet)?;

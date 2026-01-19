@@ -20,9 +20,9 @@ VORTEX is designed to scale the existing performance of Vector Engine v2.1.
 **Objective**: Establish the "Noise-Free Execution Chamber" and basic hardware telemetry.
 
 - **Tasks**:
-    - [ ] Skeleton setup: `vortex-io`, `vortex-core`, `vortex-server`.
-    - [ ] **Adaptive Hardware Discovery**: Logic to detect physical core count, NUMA nodes, and Disk physical sector size.
-    - [ ] **Resilient Memory Locking**: Attempt `mlockall` but handle `ENOMEM` gracefully with logging.
+    - [x] Skeleton setup: `vortex-io`, `vortex-core`, `vortex-server`.
+    - [x] **Adaptive Hardware Discovery**: Logic to detect physical core count, NUMA nodes, and Disk physical sector size.
+    - [x] **Resilient Memory Locking**: Attempt `mlockall` but handle `ENOMEM` gracefully with logging.
     - [x] Implement `ThreadMapping`: Static pinning of LEUs (Logical Execution Units).
     - [x] Initialize `io_uring` RingDriver: Setup Submission/Completion queues.
 - **Verification**:
@@ -35,10 +35,10 @@ VORTEX is designed to scale the existing performance of Vector Engine v2.1.
 **Objective**: Implement the VBP (VORTEX Binary Protocol) and the zero-copy buffer lifecycle.
 
 - **Tasks**:
-    - [ ] Define VBP Request/Response frames with `rkyv`.
-    - [ ] Implement the `BufferPool`: Pre-allocated memory rings with handover logic.
+    - [x] Define VBP Request/Response frames with `rkyv`.
+    - [x] Implement the `BufferPool`: Pre-allocated memory rings with handover logic.
     - [ ] Security Gatekeeper: Integreate `rustls` (mTLS) and `Biscuit` (Auth) on raw buffer slices.
-    - [ ] Implement `LayoutValidator`: Strict mathematical check of message alignment.
+    - [x] Implement `LayoutValidator`: Strict mathematical check of message alignment.
 - **Verification**:
     - Fuzzing the protocol parser with malformed lengths and invalid binary garbage.
     - Ownership tracking tests to ensure buffers are locked during "Persistence" simulation.
@@ -49,10 +49,10 @@ VORTEX is designed to scale the existing performance of Vector Engine v2.1.
 **Objective**: Build the single-threaded, non-blocking execution reactor.
 
 - **Tasks**:
-    - [ ] Develop the `ShardCoordinator` Event Loop.
-    - [ ] Implement the Reactor: Collaborative multitasking via `async/await` state machines.
-    - [ ] **Backpressure Valve**: Implement `SQE_Depth` monitoring and `THROTTLED` state transition.
-    - [ ] Internal Messaging: SPSC Lock-free channels for inter-shard mis-routing handovers.
+    - [x] Develop the `ShardCoordinator` Event Loop.
+    - [x] Implement the Reactor: Collaborative multitasking via `async/await` state machines.
+    - [x] **Backpressure Valve**: Implement `SQE_Depth` monitoring and `THROTTLED` state transition.
+    - [x] Internal Messaging: SPSC Lock-free channels for inter-shard mis-routing handovers.
 - **Verification**:
     - Latency jitter tests on the polling loop under high artificial load.
     - Verify TCP window throttling when `SQE_Depth > High_Water_Mark`.
@@ -63,10 +63,10 @@ VORTEX is designed to scale the existing performance of Vector Engine v2.1.
 **Objective**: Implement the LSM-Tree and WAL with crash recovery guarantees.
 
 - **Tasks**:
-    - [ ] **BOOT_REPLAY**: Blocking WAL replay logic and `MANIFEST` checkpoint management.
-    - [ ] WAL Implementation: `O_DIRECT | O_DSYNC` appends with `IOSQE_IO_LINK` ordering.
-    - [ ] MemTable: Single-author Skiplist/RB-Tree (Lock-free).
-    - [ ] SSTable: 4KB block-aligned storage with CRC32C integrity checksums.
+    - [x] **BOOT_REPLAY**: Blocking WAL replay logic and `MANIFEST` checkpoint management.
+    - [x] WAL Implementation: `O_DIRECT | O_DSYNC` appends with `IOSQE_IO_LINK` ordering.
+    - [x] MemTable: Single-author Skiplist/RB-Tree (Lock-free).
+    - [x] SSTable: 4KB block-aligned storage with CRC32C integrity checksums.
 - **Verification**:
     - Torn-write recovery: Hard-killing the process during WAL writes and verifying successful truncation/replay.
     - Corruption scrubbing: Manually flipping bits in SSTables to trigger CRC failures and Raft repair (simulated).
@@ -77,9 +77,9 @@ VORTEX is designed to scale the existing performance of Vector Engine v2.1.
 **Objective**: Integrate Vector Engine v2.1 and optimize via SIMD/Kernel-Bypass.
 
 - **Tasks**:
-    - [ ] **Engine Porting**: Wrap existing Vector Engine v2.1 logic as a `vortex-core` component.
-    - [ ] Distance Metrics: Upgrade existing math to AVX-512 for Ryzen/EPYC performance.
-    - [ ] HNSW Graph: Shift from standard pointers to CSR-style 32-bit relative pointers.
+    - [x] **Engine Porting**: Wrap existing Vector Engine v2.1 logic as a `vortex-core` component.
+    - [x] Distance Metrics: Upgrade existing math to AVX-512 for Ryzen/EPYC performance.
+    - [x] HNSW Graph: Shift from standard pointers to CSR-style 32-bit relative pointers.
     - [ ] **Compaction Hook**: Implement the side-car index builder during LSM merges.
 - **Verification**:
     - Regression Testing: Ensure VORTEX matches or exceeds v2.1 throughput on identical hardware.
@@ -92,9 +92,9 @@ VORTEX is designed to scale the existing performance of Vector Engine v2.1.
 
 - **Tasks**:
     - [ ] **Raft Consistency**: One Raft group per VNode; multi-AZ placement policy.
-    - [ ] Consistent Hashing: Ketama ring for deterministic request routing.
-    - [ ] Telemetry Sidecar: Lock-free per-shard registries and Seqlock aggregation.
-    - [ ] **Tail-Based Tracing**: 1,000-request circular buffers for error/latency dumping.
+    - [x] Consistent Hashing: Ketama ring for deterministic request routing.
+    - [x] Telemetry Sidecar: Lock-free per-shard registries and Seqlock aggregation.
+    - [x] **Tail-Based Tracing**: 1,000-request circular buffers for error/latency dumping.
 - **Verification**:
     - Jepsen linearizability tests under network partition and clock skew.
     - Profiling with `eBPF` to verify zero observer effect on high-performance cores.

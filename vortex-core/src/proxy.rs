@@ -13,12 +13,13 @@ use crossbeam_utils::sync::WaitGroup;
 pub struct ShardProxy {
     num_shards: usize,
     max_elements_per_shard: usize,
+    storage_dir: String,
 }
 
 impl ShardProxy {
     /// Initializes a new Proxy orchestrator.
-    pub fn new(num_shards: usize, max_elements_per_shard: usize) -> Self {
-        Self { num_shards, max_elements_per_shard }
+    pub fn new(num_shards: usize, max_elements_per_shard: usize, storage_dir: String) -> Self {
+        Self { num_shards, max_elements_per_shard, storage_dir }
     }
 
     /// Spawns and pins all Shard Reactor threads.
@@ -39,13 +40,14 @@ impl ShardProxy {
             let port = start_port;
             let wg = wg.clone();
             let max_el = self.max_elements_per_shard;
+            let dir = self.storage_dir.clone();
 
             let result = thread::Builder::new()
                 .name(format!("shard_{}", shard_id))
                 .stack_size(512 * 1024) // 512KB stack (Termux Friendly)
                 .spawn(move || {
                     vortex_io::platform::affinity::pin_thread_to_core(shard_id);
-                    let mut reactor = ShardReactor::new(shard_id, 256, max_el);
+                    let mut reactor = ShardReactor::new(shard_id, 256, max_el, &dir);
                     if let Err(e) = reactor.listen(port) {
                         panic!("CRITICAL: Shard {} failed to bind port {}: {}", shard_id, port, e);
                     }
@@ -72,7 +74,7 @@ impl ShardProxy {
         
         // This shard must handle its own pinning and setup
         vortex_io::platform::affinity::pin_thread_to_core(main_shard_id);
-        let mut reactor = ShardReactor::new(main_shard_id, 256, max_el);
+        let mut reactor = ShardReactor::new(main_shard_id, 256, max_el, &self.storage_dir);
         reactor.listen(port).expect("Main shard bind failed");
 
         // Signal cluster readiness if others are waiting (Wait for those that actually spawned)

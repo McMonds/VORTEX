@@ -72,7 +72,7 @@ fn main() -> Result<()> {
 
     // 5. Initialize Milestone 6 Shard Proxy (The Brain)
     info!("Phase 4: initializing Shard Proxy (Capacity: {}/shard)...", max_elements);
-    let proxy = Arc::new(vortex_core::proxy::ShardProxy::new(num_shards, max_elements));
+    let proxy = Arc::new(vortex_core::proxy::ShardProxy::new(num_shards, max_elements, args.dir));
     
     // 5. Setup Graceful Shutdown (Signal Handler)
     info!("Phase 5: registering signal handlers...");

@@ -42,12 +42,12 @@ pub struct ShardReactor {
 }
 
 impl ShardReactor {
-    pub fn new(shard_id: usize, ring_entries: u32, max_elements: usize) -> Self {
+    pub fn new(shard_id: usize, ring_entries: u32, max_elements: usize, base_path: &str) -> Self {
         let ring = RingDriver::new(ring_entries).expect("Failed to init io_uring");
         let pool = BufferPool::new(ring_entries as usize, 4096);
         
-        // Initialize WAL in current directory for now
-        let mut wal = WalManager::new(shard_id, ".").expect("Failed to init WAL");
+        // Initialize WAL in requested directory (Rule #8/Milestone 4)
+        let mut wal = WalManager::new(shard_id, base_path).expect("Failed to init WAL");
         
         // Dynamic dimension 128, capacity controlled by caller (Target 0 Scaling)
         let mut index = HnswIndex::new(128, max_elements);
@@ -319,6 +319,8 @@ impl ShardReactor {
         };
 
         let expected = 16 + header.payload_len as usize;
+        debug!("Shard {} Ingress -> Received frame. Logical Len: {}, Physical Len: {}", self.shard_id, expected, total);
+
         if total < expected {
             let fd = self.active_fds[idx].unwrap();
             self.submit_read_at(fd, idx, total);
@@ -370,11 +372,27 @@ impl ShardReactor {
                 self.submit_write(idx);
             },
             CMD_UPSERT => {
-                // Rule 9: Persistence Precedes Response
+                // Rule 9: Persistence Precedes Response. 
+                // CRITICAL: O_DIRECT requires PAGE_SIZE (4KB) alignment for both OFFSET and LENGTH.
                 let tag = TAG_WAL_PREFIX | (idx as u64);
-                // Note: We write the FULL packet (Header + Payload) to the WAL for perfect reconstruction.
-                // We use the 'total' read from the socket, and data_ptr we extracted.
-                let wal_e = self.wal.write_entry(data_ptr, total as u32, tag);
+                
+                // Align length to 4096 bytes if necessary
+                let aligned_len = if total % 4096 != 0 {
+                    let new_len = ((total / 4096) + 1) * 4096;
+                    // Zero out the padding area in the buffer
+                    let page = self.pool.get_page_mut(idx);
+                    let data = page.as_slice_mut();
+                    if new_len <= data.len() {
+                        for b in &mut data[total..new_len] { *b = 0; }
+                        new_len
+                    } else {
+                        total // Fallback if record somehow exceeds page size
+                    }
+                } else {
+                    total
+                };
+
+                let wal_e = self.wal.write_entry(data_ptr, aligned_len as u32, tag);
                 self.push_submission(&wal_e);
             },
             _ => {
@@ -387,7 +405,7 @@ impl ShardReactor {
     }
 
     fn handle_wal_complete(&mut self, idx: usize, bytes: usize) {
-        info!("Shard {} WAL Persisted ({} bytes). Finalizing command.", self.shard_id, bytes);
+        debug!("Shard {} WAL Persisted ({} bytes). Finalizing command.", self.shard_id, bytes);
         
         // 1. Retrieve Payload
         // The buffer contains [RequestHeader (16b)] [ID (8b)] [Vector (N * 4b)]
@@ -404,22 +422,25 @@ impl ShardReactor {
              return;
         }
 
-        // 2. Parse ID and Vector
-        // We use unsafe cast for zero-copy parsing or aligned reads.
+        // 2. Parse ID and Vector using LOGICAL length from the header
+        // Header contains: magic(2) + status(1) + opcode(1) + payload_len(4) + request_id(8) = 16 bytes.
+        // But we are reading the REQUEST header from the WAL: magic(2) + version(1) + opcode(1) + payload_len(4) + request_ids(8) = 16 bytes.
+        let header = unsafe { &*(data.as_ptr() as *const vortex_rpc::RequestHeader) };
+        let logical_payload_len = header.payload_len as usize;
+        
         // Data is aligned to 4096, so offset 16 is aligned for u64 (8) and f32 (4).
         let payload_ptr = unsafe { data.as_ptr().add(header_size) };
         
         // Parse ID (8 bytes)
         let id = unsafe { *(payload_ptr as *const u64) };
         
-        // Parse Vector
-        // Remaining bytes = bytes - header - id
-        let vec_bytes = bytes - header_size - 8;
+        // Parse Vector (logical dimension)
+        let vec_bytes = logical_payload_len - 8;
         let dim = vec_bytes / 4;
         
         if dim == 0 {
-             error!("Shard {} WAL Complete: Vector dimension is 0.", self.shard_id);
-             self.prepare_response_buffer(idx, CMD_UPSERT, STATUS_ERR, 0);
+             error!("Shard {} WAL Complete: Logical vector dimension is 0.", self.shard_id);
+             self.prepare_response_buffer(idx, CMD_UPSERT, STATUS_ERR, header.request_id);
              self.submit_write(idx);
              return;
         }
