@@ -3,8 +3,6 @@
 > [!TIP]
 > **MISSION ACOMPLISHED**: VORTEX has achieved sustained throughput of **>40,000 Ops/Sec** with sub-millisecond latency on standard hardware, validated by the "Elite Mission Control" Command Center.
 
-![VORTEX Command Center](docs/images/mission_control_success.png)
-
 ## 🚀 The VORTEX Advantage
 VORTEX is a research-grade vector database built to solve the **Persistence Bottleneck**. By bypassing the OS Page Cache and pinning "Shard Reactors" to physical cores, VORTEX achieves what traditional databases cannot:
 - **Zero-Copy I/O**: Direct memory transfer from user space to NVMe via `io_uring` and `O_DIRECT`.

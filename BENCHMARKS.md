@@ -38,14 +38,6 @@ The benchmark was conducted using the **Forensic Saturation Burn** methodology:
 
 ---
 
-## 🖼️ Forensic Evidence
-
-![Mission Control Success](docs/images/mission_control_success.png)
-
-*The dashboard confirms 100% ACK delivery with active backpressure handling (875 events/sec) preventing system collapse.*
-
----
-
 ## 🏁 Reproducing Results
 
 To reproduce these results on compatible Linux hardware:
