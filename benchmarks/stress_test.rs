@@ -11,10 +11,10 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value_t = 16)]
+    #[arg(short, long, default_value_t = 32)]
     concurrency: usize,
 
-    #[arg(short, long, default_value_t = 5000)]
+    #[arg(short, long, default_value_t = 80000)]
     requests: usize,
 
     #[arg(short, long, default_value_t = 9000)]
