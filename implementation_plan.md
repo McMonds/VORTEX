@@ -38,10 +38,47 @@ VORTEX is designed to scale the existing performance of Vector Engine v2.1.
     - [x] Define VBP Request/Response frames with `rkyv`.
     - [x] Implement the `BufferPool`: Pre-allocated memory rings with handover logic.
     - [ ] Security Gatekeeper: Integreate `rustls` (mTLS) and `Biscuit` (Auth) on raw buffer slices.
-    - [x] Implement `LayoutValidator`: Strict mathematical check of message alignment.
-- **Verification**:
-    - Fuzzing the protocol parser with malformed lengths and invalid binary garbage.
-    - Ownership tracking tests to ensure buffers are locked during "Persistence" simulation.
+    - [x] Implement `LayoutValidator`: Strict mathematical check of### [Dashboard Core] (main.rs)
+- **CLI Expansion**: Implement `-p/--port`, `-d/--dir`, `-c/--capacity`, and `--shards`.
+- **Log parser**: Add capture for `Search: N ops, T us, D dists` and `Health: I ms ingress, F ms flush` pulses.
+- **Uptime Tracking**: Calculate run duration in Minutes:Seconds.
+- **Total Ops**: Global cumulative counter for successful ACKs.
+
+### [Orchestration] (lifecycle.rs)
+- **Arg Forwarding**: Update `spawn_server` to accurately forward all dashboard CLI parameters to the `vortex-server` binary.
+
+### [Forensics] (metrics.rs)
+- **Network Efficiency**: Parse `/proc/net/dev` for raw TX/RX Mbps. Calculate "Packet Overhead Ratio" (VBP Payload / Raw Wire Bytes).
+- **Dynamic Port**: construction of `target_port_suffix` using the hex constraint.
+- **CPU Breakdown**: Implement parsing for `User%`, `System%`, `SoftIRQ%`.
+- **Context Switches**: Parse voluntary/involuntary switches from `/proc/stat`.
+
+### [Reactor Core] (reactor.rs)
+- **Compute Layer**: Track `tick_search_micros`, `tick_search_ops`, `tick_nodes_inspected`.
+- **Contention Profiling**: Measure `time_ingress` (logic) vs `time_flush` (persistence).
+- **Aggregated Logging**: Emit 1Hz pulse: `PULSE [Search] ops={N} time={T}us dist={D} | [Health] ingress={I}ms flush={F}ms`.
+
+### [TUI Layout] (tui.rs)
+- **Section A: Mission Header**: Uptime, Build Mode, Instant/Peak Throughput, Total Ops.
+- **Section B: Engine Dynamics**: 
+    *   Batch Saturation Bar & Avg Batch Size.
+    *   Flush Ratios (Full vs EOT).
+    *   **WAF**: (Physical Disk Bytes / Logical Ingress Bytes).
+    *   **Search Stats**: Dedicated QPS & Latency Histogram (P50/P99).
+- **Section C: Hardware Stress**: 
+    *   Core Util Bars & Core Balance (StdDev).
+    *   Context Switch Rate.
+    *   CPU Breakdown (User/Sys/SoftIRQ).
+    *   **Shard Health**: Opcode Ratio (W/R), Cycle Starvation (Ingress vs Flush).
+    *   **Warning**: "READ LATENCY RISK" if Flush Time > 20ms.
+- **Section D: Diagnostics**: 
+    *   Rx-Queue Depth & TCP Collisions/Drops.
+    *   **Wire Speed**: Physical Mbps (TX/RX).
+    *   **Efficiency**: Packet Overhead Ratio.
+
+### [Benchmark Utility] (stress_test.rs)
+- **Mixed Mode**: Implement `--mode mixed` (8 Writers / 8 Readers).
+- **Precise Histograms**: Collect `Vec<Duration>` per thread, merge, and sort for the 4-block receipt (P50, P99, Max/Jitter).
 
 ---
 

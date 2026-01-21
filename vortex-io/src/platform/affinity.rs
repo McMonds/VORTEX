@@ -1,5 +1,5 @@
 use std::mem;
-use log::info;
+use log::{info, warn};
 
 /// Pins the current thread to a specific physical CPU core.
 ///
@@ -12,8 +12,9 @@ use log::info;
 /// This function performs an FFI call to `sched_setaffinity`. 
 /// It relies on `libc::cpu_set_t` layout being correct for the target OS.
 ///
-/// # Panics
-/// Panics if the FFI call fails, as VORTEX relies on strict core pinning.
+/// # Errors
+/// Logs a warning if pinning fails (e.g., core index out of bounds). 
+/// It does NOT panic, allowing the thread to run "floating" if affinity is impossible.
 pub fn pin_thread_to_core(core_id: usize) {
     let mut cpu_set: libc::cpu_set_t = unsafe { mem::zeroed() };
     
@@ -37,7 +38,8 @@ pub fn pin_thread_to_core(core_id: usize) {
 
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        panic!("CRITICAL: Failed to pin thread to core {}. Error: {}", core_id, err);
+        warn!("Failed to pin thread to core {}. Error: {} (Running floating)", core_id, err);
+        return;
     }
 
     info!("Thread successfully pinned to Physical Core {}", core_id);

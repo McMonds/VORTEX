@@ -1,202 +1,350 @@
-use std::collections::VecDeque;
+use std::collections::HashSet;
 use std::fs;
 use std::time::Instant;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
-pub struct MetricsSnapshot {
-    #[allow(dead_code)]
-    pub timestamp: Instant,
-    pub cpu_user: f64,
-    pub cpu_sys: f64,
-    pub cpu_cores: Vec<f64>,
-    pub throughput_ops: f64,
-    #[allow(dead_code)]
-    pub disk_write_kb: f64,
-    pub socket_q_depth: usize,
-    #[allow(dead_code)]
+// =================================================================================
+// 1. Raw Snapshot (Pure Data Layer)
+// Holds raw u64 counters. Zero logic. Zero rates. Zero floats.
+// Source: /proc/stat, /proc/diskstats, /proc/net/*
+// =================================================================================
+#[derive(Debug, Clone, Default)]
+pub struct RawSnapshot {
+    pub timestamp: Option<Instant>, // Added Option for clear "Before Start" state
+    
+    // CPU: Absolute Ticks (USER_HZ)
+    pub cpu_total_ticks: Vec<u64>, 
+    pub cpu_work_ticks: Vec<u64>, 
+    pub cpu_user_ticks: Vec<u64>,
+    pub cpu_system_ticks: Vec<u64>,
+    pub cpu_softirq_ticks: Vec<u64>,
+
+    // Disk: Absolute Sectors
+    pub disk_sectors_written: u64,
+
+    // Net: Absolute Packets/Bytes
+    pub net_rx_queue: u64, // Instantaneous
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
+    pub net_prune_called: u64, // Cumulative Counter
+    
+    // Mem: Absolute KB
+    pub memory_rss_kb: u64,
     pub context_switches: u64,
-    pub batch_size_avg: f64,
-    pub rss_kb: u64,
 }
 
-pub struct MetricsState {
-    pub history: VecDeque<MetricsSnapshot>,
-    pub total_acks: usize,
-    pub start_time: Instant,
+// =================================================================================
+// 2. Metrics Snapshot (Presentation Layer)
+// The calculated rates (Delta / Time) ready for TUI.
+// =================================================================================
+#[derive(Debug, Clone)]
+pub struct MetricsSnapshot {
+    pub timestamp: Instant,
     
-    // Phase 9: Mission Control
-    pub peak_throughput: f64,
-    pub eot_flushes: usize,
-    pub full_flushes: usize,
-    pub backpressure_events: usize,
-    pub shard_pulses: Vec<Instant>,
+    // Hardware Rates
+    pub cpu_usage_pct: Vec<f64>, // Index 0 = Global, 1..N = Cores
+    pub sys_efficiency_pct: f64, // (Sys + IRQ + SoftIRQ) / Total Work
+    pub rss_mem_mb: f64,
     
-    // Internal counters for deltas
-    last_disk_sectors: u64,
-    last_context_switches: u64,
-    last_sample_time: Instant,
+    // IO Rates
+    pub disk_write_mb_s: f64,
+    pub net_rx_backlog: u64,
+    pub net_prunes_per_sec: f64,
     
-    // Phase 9: CPU delta tracking (total, work, system)
-    last_cpu_total: Vec<u64>,
-    last_cpu_work: Vec<u64>,
-    last_cpu_sys: Vec<u64>,
+    // Foreman Sub-Layer Metrics
+    pub net_tx_mbps: f64,
+    pub net_rx_mbps: f64,
+    pub net_efficiency_ratio: f64,
+    pub cpu_user_pct: Vec<f64>,
+    pub cpu_system_pct: Vec<f64>,
+    pub cpu_softirq_pct: Vec<f64>,
+    pub context_switches_per_sec: f64,
 }
 
-impl MetricsState {
-    pub fn new() -> Self {
+impl Default for MetricsSnapshot {
+    fn default() -> Self {
         Self {
-            history: VecDeque::with_capacity(1000),
-            total_acks: 0,
-            start_time: Instant::now(),
-            peak_throughput: 0.0,
-            eot_flushes: 0,
-            full_flushes: 0,
-            backpressure_events: 0,
-            shard_pulses: vec![Instant::now(); 2], // Default to 2 shards
-            last_disk_sectors: 0,
-            last_context_switches: 0,
-            last_sample_time: Instant::now(),
-            last_cpu_total: vec![0; 5], // Total + Core 0-3
-            last_cpu_work: vec![0; 5],
-            last_cpu_sys: vec![0; 5],
+            timestamp: Instant::now(),
+            cpu_usage_pct: vec![],
+            sys_efficiency_pct: 0.0,
+            rss_mem_mb: 0.0,
+            disk_write_mb_s: 0.0,
+            net_prunes_per_sec: 0.0,
+            net_rx_backlog: 0,
+            net_tx_mbps: 0.0,
+            net_rx_mbps: 0.0,
+            net_efficiency_ratio: 0.0,
+            cpu_user_pct: vec![],
+            cpu_system_pct: vec![],
+            cpu_softirq_pct: vec![],
+            context_switches_per_sec: 0.0,
         }
     }
+}
 
-    pub fn check_perf_permissions() -> Result<()> {
-        let paranoid = fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
-            .unwrap_or_else(|_| "2".to_string())
-            .trim()
-            .parse::<i32>()
-            .unwrap_or(2);
+// =================================================================================
+// 3. System Sampler (The Logic Layer)
+// Handles Sampling, Deltas, Normalization, and Safe Math.
+// =================================================================================
+pub struct SystemSampler {
+    // Static Hardware Constants
+    sector_size: u64,
+    valid_disks: HashSet<String>,
+    target_port_suffix: String,
+    
+    // State
+    prev_snapshot: RawSnapshot,
+    server_pid: Option<u32>,
+}
+
+impl SystemSampler {
+    pub fn new(server_pid: Option<u32>, port: u16) -> Self {
+        let sector_size = Self::detect_sector_size();
+        let valid_disks = Self::scan_physical_disks();
         
-        if paranoid >= 2 {
-            return Err(anyhow!("Kernel blocked perf_event_open (perf_event_paranoid={}). Run: 'sudo sysctl -w kernel.perf_event_paranoid=1'", paranoid));
+        // Constraint 2: The Port Hex Hex
+        let target_port_suffix = format!(":{:04X}", port);
+
+        Self {
+            sector_size,
+            valid_disks,
+            target_port_suffix,
+            prev_snapshot: RawSnapshot::default(),
+            server_pid,
         }
-        Ok(())
     }
 
-    pub fn sample(&mut self, server_pid: u32, batch_throughput: f64, batch_size: f64) -> Result<()> {
-        let now = Instant::now();
-        let delta_t = now.duration_since(self.last_sample_time).as_secs_f64();
-        if delta_t == 0.0 { return Ok(()); }
+    // Constraint 1: The Disk Deduplication (Verification)
+    // Only trust devices that DO NOT have a specific partition signature
+    fn scan_physical_disks() -> HashSet<String> {
+        let mut valid = HashSet::new();
+        if let Ok(entries) = fs::read_dir("/sys/block") {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    // Skip loopback and ram disks
+                    if name.starts_with("loop") || name.starts_with("ram") { continue; }
+                    
+                    // We want: sda, nvme, and dm- (LVM/Mapper)
+                    // Partitions usually have a 'partition' file in sysfs, roots don't.
+                    let part_path = entry.path().join("partition");
+                    if !part_path.exists() {
+                        valid.insert(name);
+                    }
+                }
+            }
+        }
+        valid
+    }
 
-        // 3. Socket Queues (/proc/net/tcp) - Targeted for Port 9000 (0x2328)
-        let tcp = fs::read_to_string("/proc/net/tcp")?;
-        let mut q_depth = 0;
-        let target_port_hex = ":2328"; // 9000 in hex
-        for line in tcp.lines().skip(1) {
+    fn detect_sector_size() -> u64 {
+        // Try reading nvme0n1 first, then sda... fallback to 512.
+        if let Ok(entries) = fs::read_dir("/sys/block") {
+             for entry in entries.flatten() {
+                 let name = entry.file_name().into_string().unwrap_or_default();
+                 if name.starts_with("loop") { continue; }
+                 
+                 let queue_path = entry.path().join("queue/hw_sector_size");
+                 if let Ok(s) = fs::read_to_string(queue_path) {
+                     if let Ok(v) = s.trim().parse::<u64>() {
+                         return v;
+                     }
+                 }
+             }
+        }
+        512 // Legacy Fallback
+    }
+
+    pub fn capture(&mut self) -> Result<MetricsSnapshot> {
+        let now = Instant::now();
+        let mut raw = RawSnapshot {
+            timestamp: Some(now),
+            cpu_total_ticks: vec![],
+            cpu_work_ticks: vec![],
+            cpu_user_ticks: vec![],
+            cpu_system_ticks: vec![],
+            cpu_softirq_ticks: vec![],
+            disk_sectors_written: 0,
+            net_rx_queue: 0,
+            net_tx_bytes: 0,
+            net_rx_bytes: 0,
+            net_prune_called: 0,
+            memory_rss_kb: 0,
+            context_switches: 0,
+        };
+
+        // --- 1. Parse /proc/stat (CPU & Context Switches) ---
+        let stat = fs::read_to_string("/proc/stat")?;
+        for line in stat.lines() {
+            if line.starts_with("cpu") && line.as_bytes().get(3).map_or(false, |&b| b.is_ascii_digit()) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 8 { continue; }
+
+                let user: u64 = parts[1].parse().unwrap_or(0);
+                let nice: u64 = parts[2].parse().unwrap_or(0);
+                let system: u64 = parts[3].parse().unwrap_or(0);
+                let idle: u64 = parts[4].parse().unwrap_or(0);
+                let iowait: u64 = parts[5].parse().unwrap_or(0);
+                let irq: u64 = parts[6].parse().unwrap_or(0);
+                let softirq: u64 = parts[7].parse().unwrap_or(0);
+
+                let work = user + nice + system + irq + softirq;
+                let total = work + idle + iowait;
+
+                raw.cpu_work_ticks.push(work);
+                raw.cpu_total_ticks.push(total);
+                raw.cpu_user_ticks.push(user + nice);
+                raw.cpu_system_ticks.push(system + irq);
+                raw.cpu_softirq_ticks.push(softirq);
+            } else if line.starts_with("ctxt ") {
+                raw.context_switches = line[5..].trim().parse().unwrap_or(0);
+            }
+        }
+        
+        // --- 2. Parse /proc/diskstats (Disk) ---
+        // Constraint 1: Filter using `valid_disks` set
+        let diskwrapper = fs::read_to_string("/proc/diskstats")?;
+        for line in diskwrapper.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 4 && parts[1].ends_with(target_port_hex) {
-                // Column 4 is rx_queue:tx_queue (hex)
-                if let Some(queue_part) = parts.get(3) { // It's actually column 4 (index 3) in most proc net tcp
-                     let queues: Vec<&str> = queue_part.split(':').collect();
-                     if queues.len() == 2 {
-                         q_depth = usize::from_str_radix(queues[0], 16).unwrap_or(0);
-                         break; // We found our target listener
+            if parts.len() > 13 {
+                let dev_name = parts[2];
+                if self.valid_disks.contains(dev_name) {
+                    // Column 10 (index 9) = sectors written
+                    let written: u64 = parts[9].parse().unwrap_or(0);
+                    raw.disk_sectors_written += written;
+                }
+            }
+        }
+
+        // --- 3. Parse /proc/net/tcp (RxQueue) ---
+        if let Ok(tcp) = fs::read_to_string("/proc/net/tcp") {
+            for line in tcp.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 4 && parts[1].ends_with(&self.target_port_suffix) {
+                     // Column 4: tx:rx (hex). Split on ':' -> Index 1 is RX
+                     if let Some(col) = parts.get(4) {
+                         let queues: Vec<&str> = col.split(':').collect();
+                         if queues.len() == 2 {
+                             // Sum across all shards/connections
+                             let q = u64::from_str_radix(queues[1], 16).unwrap_or(0);
+                             raw.net_rx_queue += q;
+                         }
                      }
                 }
             }
         }
-
-        // 4. Per-Core CPU & Syscall Efficiency (/proc/stat)
-        let stat = fs::read_to_string("/proc/stat")?;
-        let mut core_utils = Vec::new();
-        let mut sys_utils = Vec::new();
-        let mut cpu_idx = 0;
-        for line in stat.lines() {
-            if line.starts_with("cpu") && cpu_idx < 5 {
+        
+        // --- 4. Parse /proc/net/dev (Mbps) ---
+        if let Ok(dev) = fs::read_to_string("/proc/net/dev") {
+            for line in dev.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    let user: u64 = parts[1].parse().unwrap_or(0);
-                    let nice: u64 = parts[2].parse().unwrap_or(0);
-                    let system: u64 = parts[3].parse().unwrap_or(0);
-                    let idle: u64 = parts[4].parse().unwrap_or(0);
-                    let iowait: u64 = parts[5].parse().unwrap_or(0);
-                    
-                    let work = user + nice + system;
-                    let total = work + idle + iowait;
-                    
-                    if self.last_cpu_total[cpu_idx] > 0 {
-                        let diff_total = total - self.last_cpu_total[cpu_idx];
-                        let diff_work = work - self.last_cpu_work[cpu_idx];
-                        let diff_sys = system - self.last_cpu_sys[cpu_idx];
-                        
-                        let util = (diff_work as f64 / diff_total as f64) * 100.0;
-                        let sys_util = (diff_sys as f64 / diff_total as f64) * 100.0;
-                        core_utils.push(util);
-                        sys_utils.push(sys_util);
-                    } else {
-                        core_utils.push(0.0);
-                        sys_utils.push(0.0);
-                    }
-                    self.last_cpu_total[cpu_idx] = total;
-                    self.last_cpu_work[cpu_idx] = work;
-                    self.last_cpu_sys[cpu_idx] = system;
-                    cpu_idx += 1;
+                if parts.len() > 9 {
+                    if parts[0].starts_with("lo:") { continue; }
+                    let rx: u64 = parts[1].parse().unwrap_or(0);
+                    let tx: u64 = parts[9].parse().unwrap_or(0);
+                    raw.net_rx_bytes += rx;
+                    raw.net_tx_bytes += tx;
                 }
             }
         }
         
-        let global_cpu = core_utils.get(0).cloned().unwrap_or(0.0);
-        let cpu_sys = sys_utils.get(0).cloned().unwrap_or(0.0);
-        let core_utils_final = core_utils.into_iter().skip(1).collect(); // Keep Core 0-3
-
-        // 5. RSS Memory & Context Switches (/proc/[pid]/status)
-        let status = fs::read_to_string(format!("/proc/{}/status", server_pid))?;
-        let mut rss_kb = 0;
-        let mut voluntary = 0u64;
-        let mut non_voluntary = 0u64;
-        for line in status.lines() {
-            if line.starts_with("VmRSS:") {
-                rss_kb = line.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
-            }
-            if line.starts_with("voluntary_ctxt_switches:") {
-                voluntary = line.split_whitespace().last().unwrap_or("0").parse()?;
-            }
-            if line.starts_with("nonvoluntary_ctxt_switches:") {
-                non_voluntary = line.split_whitespace().last().unwrap_or("0").parse()?;
+        // --- 4. Parse /proc/net/netstat (PruneCalled) ---
+        // Defect 15: The Recv-Q Snapshot Lie
+        if let Ok(netstat) = fs::read_to_string("/proc/net/netstat") {
+             // Need "TcpExt:" header then values
+             let lines: Vec<&str> = netstat.lines().collect();
+             for i in (0..lines.len()).step_by(2) {
+                 if lines[i].starts_with("TcpExt:") {
+                     let headers: Vec<&str> = lines[i].split_whitespace().collect();
+                     let values: Vec<&str> = lines[i+1].split_whitespace().collect();
+                     
+                     // Find "PruneCalled" index
+                     if let Some(idx) = headers.iter().position(|&x| x == "PruneCalled") {
+                         if let Some(val) = values.get(idx) {
+                             raw.net_prune_called = val.parse().unwrap_or(0);
+                         }
+                     }
+                 }
+             }
+        }
+        
+        // --- 5. Parse RSS (Server Check) ---
+        // --- 5. Parse RSS (Server Check) ---
+        if let Some(pid) = self.server_pid {
+            if let Ok(status) = fs::read_to_string(format!("/proc/{}/status", pid)) {
+                for line in status.lines() {
+                     if line.starts_with("VmRSS:") {
+                         if let Some(val_str) = line.split_whitespace().nth(1) {
+                             raw.memory_rss_kb = val_str.parse().unwrap_or(0);
+                         }
+                     }
+                }
+            } else {
+                 // Process missing ? Main loop might handle via channel event. 
+                 // We can signal failure implicitly by 0 RSS or let main handle it.
             }
         }
-        let total_cs = voluntary + non_voluntary;
-        let cs_rate = if self.last_context_switches > 0 {
-            ((total_cs - self.last_context_switches) as f64 / delta_t) as u64
-        } else { 0 };
-        self.last_context_switches = total_cs;
+        
+        // CALCULATE DELTAS
+        let mut metrics = MetricsSnapshot::default();
+        if let Some(prev_time) = self.prev_snapshot.timestamp {
+             let delta_t = now.duration_since(prev_time).as_secs_f64();
+             
+             if delta_t > 0.0 {
+                  // CPU Breakdown
+                  for (idx, &curr_total) in raw.cpu_total_ticks.iter().enumerate() {
+                      if let Some(&prev_total) = self.prev_snapshot.cpu_total_ticks.get(idx) {
+                          let d_total = s_sub(curr_total, prev_total).max(1);
+                          
+                          let usage = (s_sub(raw.cpu_work_ticks[idx], self.prev_snapshot.cpu_work_ticks[idx]) as f64 / d_total as f64) * 100.0;
+                          let user = (s_sub(raw.cpu_user_ticks[idx], self.prev_snapshot.cpu_user_ticks[idx]) as f64 / d_total as f64) * 100.0;
+                          let sys = (s_sub(raw.cpu_system_ticks[idx], self.prev_snapshot.cpu_system_ticks[idx]) as f64 / d_total as f64) * 100.0;
+                          let soft = (s_sub(raw.cpu_softirq_ticks[idx], self.prev_snapshot.cpu_softirq_ticks[idx]) as f64 / d_total as f64) * 100.0;
+                          
+                          metrics.cpu_usage_pct.push(usage);
+                          metrics.cpu_user_pct.push(user);
+                          metrics.cpu_system_pct.push(sys);
+                          metrics.cpu_softirq_pct.push(soft);
+                      }
+                  }
+                  
+                  // IO
+                  let d_sectors = s_sub(raw.disk_sectors_written, self.prev_snapshot.disk_sectors_written);
+                  let bytes = d_sectors * self.sector_size;
+                  metrics.disk_write_mb_s = (bytes as f64 / 1_048_576.0) / delta_t;
+                  
+                  // Net Flow
+                  let d_rx = s_sub(raw.net_rx_bytes, self.prev_snapshot.net_rx_bytes);
+                  let d_tx = s_sub(raw.net_tx_bytes, self.prev_snapshot.net_tx_bytes);
+                  metrics.net_rx_mbps = (d_rx as f64 * 8.0 / 1_000_000.0) / delta_t;
+                  metrics.net_tx_mbps = (d_tx as f64 * 8.0 / 1_000_000.0) / delta_t;
 
-        // 2. Disk Stats (/proc/diskstats)
-        let diskstats = fs::read_to_string("/proc/diskstats")?;
-        let mut total_sectors_written = 0u64;
-        for line in diskstats.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 9 {
-                total_sectors_written += parts[parts.len() - 5].parse::<u64>().unwrap_or(0); // 10th column (index 9) is sectors written
-            }
+                  // Prunes
+                  let d_prunes = s_sub(raw.net_prune_called, self.prev_snapshot.net_prune_called);
+                  metrics.net_prunes_per_sec = d_prunes as f64 / delta_t;
+
+                  // Context Switches
+                  let d_ctxt = s_sub(raw.context_switches, self.prev_snapshot.context_switches);
+                  metrics.context_switches_per_sec = d_ctxt as f64 / delta_t;
+              }
         }
-        let disk_kb = if self.last_disk_sectors > 0 {
-            let delta_sectors = total_sectors_written.saturating_sub(self.last_disk_sectors);
-            (delta_sectors as f64 * 0.5) / delta_t
-        } else { 0.0 };
-        self.last_disk_sectors = total_sectors_written;
+        
+        metrics.net_rx_backlog = raw.net_rx_queue;
+        metrics.rss_mem_mb = raw.memory_rss_kb as f64 / 1024.0;
+        metrics.timestamp = now;
+        
+        // Commit State (Transactional)
+        self.prev_snapshot = raw;
+        
+        Ok(metrics)
+    }
+}
 
-        // Push to history
-        self.history.push_back(MetricsSnapshot {
-            timestamp: now,
-            cpu_user: global_cpu,
-            cpu_sys,
-            cpu_cores: core_utils_final,
-            throughput_ops: batch_throughput,
-            disk_write_kb: disk_kb,
-            socket_q_depth: q_depth,
-            context_switches: cs_rate,
-            batch_size_avg: batch_size,
-            rss_kb,
-        });
-
-        if self.history.len() > 600 { // 60 seconds at 10Hz
-            self.history.pop_front();
-        }
-
-        self.last_sample_time = now;
-        Ok(())
+// Helper: Wrapping Subtraction Safe Helper
+fn s_sub(curr: u64, prev: u64) -> u64 {
+    if curr >= prev {
+        curr - prev
+    } else {
+        // Wrap around!
+        (u64::MAX - prev) + curr
     }
 }

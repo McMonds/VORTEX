@@ -1,6 +1,6 @@
 use std::process::{Command, Child, Stdio};
-use std::time::{Duration, Instant};
-use std::net::TcpStream;
+// use std::time::{Duration, Instant};
+// use std::net::TcpStream;
 use sysinfo::System;
 use anyhow::{Result, Context};
 use std::fs;
@@ -37,16 +37,18 @@ impl LifecycleManager {
         Ok(())
     }
 
-    pub fn spawn_server(&mut self, shards: usize, capacity: usize, port: u16) -> Result<()> {
+    pub fn spawn_server(&mut self, args: &crate::Args) -> Result<()> {
         let mut child = Command::new("./target/release/vortex-server")
             .arg("--shards")
-            .arg(shards.to_string())
+            .arg(args.shards.to_string())
             .arg("--capacity")
-            .arg(capacity.to_string())
+            .arg(args.capacity.to_string())
             .arg("--port")
-            .arg(port.to_string())
-            .env("RUST_LOG", "vortex_core=info,vortex_server=info")
-            .stdout(Stdio::piped())
+            .arg(args.port.to_string())
+            .arg("--dir")
+            .arg(&args.dir)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
             .context("Failed to spawn vortex-server")?;
@@ -56,24 +58,4 @@ impl LifecycleManager {
         Ok(())
     }
 
-    pub fn wait_for_readiness(&self, port: u16, timeout: Duration) -> Result<()> {
-        let start = Instant::now();
-        let addr = format!("127.0.0.1:{}", port);
-        
-        while start.elapsed() < timeout {
-            if TcpStream::connect(&addr).is_ok() {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        
-        Err(anyhow::anyhow!("Readiness timeout: VORTEX failed to open port {} after {:?}", port, timeout))
-    }
-
-
-    pub fn kill_all(&mut self) {
-        if let Some(mut child) = self.server_process.take() {
-            let _ = child.kill();
-        }
-    }
 }

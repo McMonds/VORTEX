@@ -82,6 +82,9 @@ pub struct HnswIndex {
 
     // High-speed distance kernel
     metric_kernel: simd::SimdFunc,
+
+    // Telemetry (Rule 11: Minimal Observer Effect)
+    pub dist_calc_count: std::cell::Cell<u64>,
 }
 
 impl HnswIndex {
@@ -102,17 +105,19 @@ impl HnswIndex {
             m0,
             ef_construction,
             max_layers,
-            arena: RwLock::new(Vec::with_capacity(max_elements * dimension)),
-            quantized_arena: RwLock::new(Vec::with_capacity(max_elements * dimension)),
-            magnitudes: RwLock::new(Vec::with_capacity(max_elements)),
-            external_ids: RwLock::new(Vec::with_capacity(max_elements)),
-            link_arena: RwLock::new(vec![u32::MAX; max_elements * link_stride]),
-            map: RwLock::new(HashMap::with_capacity(max_elements)),
+            // Start small and grow (Rule 3: Avoid upfront ghost allocations)
+            arena: RwLock::new(Vec::with_capacity(1000 * dimension)),
+            quantized_arena: RwLock::new(Vec::with_capacity(1000 * dimension)),
+            magnitudes: RwLock::new(Vec::with_capacity(1000)),
+            external_ids: RwLock::new(Vec::with_capacity(1000)),
+            link_arena: RwLock::new(Vec::with_capacity(1000 * link_stride)),
+            map: RwLock::new(HashMap::with_capacity(1000)),
             entry_point: AtomicU32::new(u32::MAX),
             max_layer_active: AtomicU32::new(0),
-            visited_tags: RwLock::new(vec![0; max_elements]),
+            visited_tags: RwLock::new(Vec::with_capacity(1000)),
             global_search_id: AtomicU32::new(1),
             metric_kernel: simd::get_vector_kernel(),
+            dist_calc_count: std::cell::Cell::new(0),
         }
     }
 
@@ -165,6 +170,7 @@ impl HnswIndex {
         let mut candidates = BinaryHeap::new();
         let mut results = BinaryHeap::new();
         let dist = unsafe { (self.metric_kernel)(query.as_ptr(), arena.as_ptr().add(ep * self.dimension), self.dimension) };
+        self.dist_calc_count.set(self.dist_calc_count.get() + 1);
         let entry = Candidate { node_id: ep, distance: dist };
         candidates.push(MinCandidate(entry.clone()));
         results.push(MaxCandidate(entry));
@@ -176,6 +182,7 @@ impl HnswIndex {
                 if visited[nid as usize] == search_id { continue; }
                 visited[nid as usize] = search_id;
                 let d = unsafe { (self.metric_kernel)(query.as_ptr(), arena.as_ptr().add(nid as usize * self.dimension), self.dimension) };
+                self.dist_calc_count.set(self.dist_calc_count.get() + 1);
                 if results.len() < ef || d < results.peek().unwrap().0.distance {
                     let c = Candidate { node_id: nid as usize, distance: d };
                     candidates.push(MinCandidate(c.clone()));
@@ -204,6 +211,7 @@ impl HnswIndex {
         let mut candidates = BinaryHeap::new();
         let mut results = BinaryHeap::new();
         let dist = unsafe { simd::dot_product_u8_avx2(q_i8.as_ptr(), q_arena.as_ptr().add(ep * self.dimension), self.dimension) } as f32;
+        self.dist_calc_count.set(self.dist_calc_count.get() + 1);
         let entry = Candidate { node_id: ep, distance: dist };
         candidates.push(MinCandidate(entry.clone()));
         results.push(MaxCandidate(entry));
@@ -219,6 +227,7 @@ impl HnswIndex {
                 if visited[nid as usize] == search_id { continue; }
                 visited[nid as usize] = search_id;
                 let d = unsafe { simd::dot_product_u8_avx2(q_i8.as_ptr(), q_arena.as_ptr().add(nid as usize * self.dimension), self.dimension) } as f32;
+                self.dist_calc_count.set(self.dist_calc_count.get() + 1);
                 if results.len() < ef || d < results.peek().unwrap().0.distance {
                     let c = Candidate { node_id: nid as usize, distance: d };
                     candidates.push(MinCandidate(c.clone()));
@@ -276,6 +285,16 @@ impl VectorIndex for HnswIndex {
         external_ids.push(id);
         let mut link_arena = self.link_arena.write().unwrap();
         let mut visited_tags = self.visited_tags.write().unwrap();
+        
+        // Lazy Resize (Rule 3: Avoid upfront zeroing of giant arrays)
+        let stride = self.link_stride();
+        if link_arena.len() < (logical_idx + 1) * stride {
+            link_arena.resize((logical_idx + 1) * stride, u32::MAX);
+        }
+        if visited_tags.len() < logical_idx + 1 {
+            visited_tags.resize(logical_idx + 1, 0);
+        }
+
         let ep = self.entry_point.load(AtomicOrdering::Relaxed);
         let max_l = self.max_layer_active.load(AtomicOrdering::Relaxed) as usize;
         let node_level = self.random_level();
@@ -331,6 +350,7 @@ impl VectorIndex for HnswIndex {
             .map(|c| {
                 let nid = c.node_id;
                 let d = unsafe { (self.metric_kernel)(query.as_ptr(), arena.as_ptr().add(nid * self.dimension), self.dimension) };
+                self.dist_calc_count.set(self.dist_calc_count.get() + 1);
                 (external_ids[nid], d)
             }).collect();
         refined.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());

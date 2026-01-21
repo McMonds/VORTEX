@@ -10,6 +10,7 @@ path = "stress_test.rs"
 [dependencies]
 tokio = { version = "1.36", features = ["full"] }
 vortex-rpc = { path = "../vortex-rpc" }
+vortex-core = { path = "../vortex-core" }
 rand = "0.8"
 futures = "0.3"
 log = "0.4"

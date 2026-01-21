@@ -68,9 +68,14 @@ pub struct ShardReactor {
     pending_acks: Vec<usize>,
     read_in_flight: Vec<bool>,
     
-    // Phase 9: Backpressure Aggregator
+    // Phase 11: Foreman Telemetry
     backpressure_count: usize,
     last_backpressure_report: Instant,
+    tick_search_micros: u64,
+    tick_search_ops: usize,
+    tick_ingress_ns: u64,
+    tick_flush_ns: u64,
+    last_pulse_report: Instant,
 }
 
 impl ShardReactor {
@@ -86,7 +91,7 @@ impl ShardReactor {
         let mut index = HnswIndex::new(128, max_elements);
 
         // --- THE RESURRECTION (Phase 4 Recovery) ---
-        let wal_path = format!("./shard_{}.wal", shard_id);
+        let wal_path = format!("{}/shard_{}.wal", base_path, shard_id);
         let start_time = Instant::now();
         let mut recovered_count = 0;
 
@@ -163,6 +168,11 @@ impl ShardReactor {
             read_in_flight: vec![false; 32],
             backpressure_count: 0,
             last_backpressure_report: Instant::now(),
+            tick_search_micros: 0,
+            tick_search_ops: 0,
+            tick_ingress_ns: 0,
+            tick_flush_ns: 0,
+            last_pulse_report: Instant::now(),
         }
     }
 
@@ -206,6 +216,33 @@ impl ShardReactor {
     }
 
     pub fn run_tick(&mut self) -> bool {
+        let _t_start = Instant::now();
+        let mut _work_done = false;
+        
+        // 1Hz Pulse Telemetry (Rule 11/Constraint 1)
+        if self.last_pulse_report.elapsed() >= Duration::from_secs(1) {
+             let nodes = self.index.dist_calc_count.get();
+             self.index.dist_calc_count.set(0);
+             
+             // Emit PULSE for dashboard parsing
+             info!("PULSE Shard {} | [Search] ops={} time={}us dist={} | [Health] ingress={}ms flush={}ms",
+                self.shard_id, 
+                self.tick_search_ops, 
+                self.tick_search_micros,
+                nodes,
+                self.tick_ingress_ns / 1_000_000,
+                self.tick_flush_ns / 1_000_000
+             );
+             
+             // Reset aggregators
+             self.tick_search_ops = 0;
+             self.tick_search_micros = 0;
+             self.tick_ingress_ns = 0;
+             self.tick_flush_ns = 0;
+             self.last_pulse_report = Instant::now();
+        }
+
+        // 1. Process Completions
         // Opportunistic submit of any pending SQEs
         if let Err(e) = self.ring.submit_and_wait(1) {
             error!("Shard {} Ring Error: {}", self.shard_id, e);
@@ -401,7 +438,9 @@ impl ShardReactor {
         
         // Phase 7.4: Removed pending_ops == 0 guard to enable pipelining.
         // process_ingress is guarded by read_in_flight to prevent buffer races.
+        let i_start = Instant::now();
         self.process_ingress(idx);
+        self.tick_ingress_ns += i_start.elapsed().as_nanos() as u64;
     }
 
     fn process_ingress(&mut self, idx: usize) {
@@ -466,7 +505,13 @@ impl ShardReactor {
             // Handle Request
             match opcode {
                 CMD_SEARCH => {
+                    let s_start = Instant::now();
                     let _results = self.index.search(self.scratch_query_buffer.as_slice(), 10);
+                    let s_dur = s_start.elapsed();
+                    
+                    self.tick_search_ops += 1;
+                    self.tick_search_micros += s_dur.as_micros() as u64;
+
                     self.pending_ops[idx] += 1;
                     self.prepare_response_buffer(idx, CMD_SEARCH, STATUS_OK, req_id);
                     self.submit_write(idx, None);
@@ -518,6 +563,7 @@ impl ShardReactor {
     }
 
     fn flush_active_batch(&mut self, reason: FlushReason) {
+        let f_start = Instant::now();
         if !self.active_batch.is_dirty() { return; }
         if self.flushing_batch.is_some() { return; } // Pipeline full
 
@@ -531,6 +577,7 @@ impl ShardReactor {
         let tag = TAG_BATCH_WRITE;
         let wal_e = self.wal.write_entry(ptr, len as u32, tag);
         self.push_submission(&wal_e);
+        self.tick_flush_ns += f_start.elapsed().as_nanos() as u64;
     }
 
     fn handle_batch_complete(&mut self, bytes: usize) {

@@ -1,7 +1,7 @@
 use vortex_io::platform::topology::SystemTopology;
 use vortex_io::platform::affinity::pin_thread_to_core;
 use vortex_io::platform::lock_memory_pages;
-use log::{info, warn};
+use log::info;
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -49,18 +49,10 @@ fn main() -> Result<()> {
     info!("Phase 2: hardware topology detection...");
     let topology = SystemTopology::new();
     let detected_cores = topology.physical_cores().len();
-    let available_gb = topology.available_ram() as f64 / 1e9;
+    let _available_gb = topology.available_ram() as f64 / 1e9;
     
     info!("Phase 3: calculating adaptive scaling...");
-    let (num_shards, max_elements) = if topology.is_constrained() && args.shards.is_none() && args.capacity.is_none() {
-        warn!("============================================================");
-        warn!("ADAPTIVE SCALING ENGAGED: Constrained Environment Detected.");
-        warn!("Hardware: {} Cores, {:.2} GB Available RAM", detected_cores, available_gb);
-        warn!("Config: 1 Shard, {} Vector Local Capacity (LSS Optimized).", CONSTRAINED_MAX_ELEMENTS);
-        warn!("============================================================");
-        (1, CONSTRAINED_MAX_ELEMENTS)
-    } else {
-        info!("Performance Tuning: Running in RELEASE mode is highly recommended for 20k+ ops/sec.");
+    let (num_shards, max_elements) = {
         let s = args.shards.unwrap_or(detected_cores);
         let c = args.capacity.unwrap_or(if topology.is_constrained() { CONSTRAINED_MAX_ELEMENTS } else { DEFAULT_MAX_ELEMENTS });
         info!("Performance Scaling: {} Shards, {} Vector Capacity per shard.", s, c);

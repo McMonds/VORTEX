@@ -1,163 +1,195 @@
+use std::time::Duration;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Table, Row, Cell},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use crate::metrics::MetricsState;
+use crate::AppState; 
 
-pub struct TuiAgent {
-    pub title: String,
-}
+pub struct TuiAgent;
 
 impl TuiAgent {
-    pub fn new() -> Self {
-        Self {
-            title: "VORTEX COMMAND CENTER (ELITE MISSION CONTROL)".to_string(),
-        }
-    }
 
-    pub fn draw(&self, f: &mut Frame<'_>, state: &MetricsState) {
+    pub fn draw_ui(f: &mut Frame<'_>, state: &AppState) {
+        let title_text = if state.server_online {
+            " VORTEX COMMAND CENTER [THE FOREMAN] "
+        } else {
+            " VORTEX COMMAND CENTER (⚠ OFFLINE ⚠) "
+        };
+
+        let last_hw = state.metrics_history.back();
+        let last_log = state.last_log_tick.as_ref();
+        
+        let uptime_secs = state.start_time.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        let uptime_str = format!("{:02}:{:02}", uptime_secs / 60, uptime_secs % 60);
+        let mode_str = if state.is_release { "RELEASE" } else { "DEBUG" };
+
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
-            .constraints(
-                [
-                    Constraint::Length(3), // Header
-                    Constraint::Min(10),   // Main Dynamics (3-panel)
-                    Constraint::Length(6), // Heartbeat Pulse
-                    Constraint::Length(3), // Verdict
-                ]
-                .as_ref(),
-            )
+            .constraints([
+                Constraint::Length(3), // Section A: Header
+                Constraint::Min(20),   // Sections B & C (Middle)
+                Constraint::Length(8), // Section D: Diagnostics
+            ].as_ref())
             .split(f.size());
 
-        let last = state.history.back();
-        let time_elapsed = state.start_time.elapsed().as_secs_f64();
-        let global_avg = state.total_acks as f64 / time_elapsed.max(1.0);
+        // --- SECTION A: MISSION HEADER ---
+        let header_style = if state.server_online { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::Red) };
+        let header_block = Block::default().borders(Borders::ALL).title(title_text).border_style(header_style);
+        
+        let header_text = format!(
+            " UPTIME: {} | MODE: {} | THROUGHPUT: {:.0} ops/s (PEAK: {:.0}) | TOTAL OPS: {}",
+            uptime_str, mode_str, state.throughput_instant, state.peak_throughput, state.total_acks
+        );
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(header_text, Style::default().add_modifier(Modifier::BOLD))
+        ])).block(header_block);
+        f.render_widget(header, main_chunks[0]);
 
-        // 1. Header
-        let header = Block::default()
-            .borders(Borders::ALL)
-            .title(self.title.as_str())
-            .border_style(Style::default().fg(Color::Cyan));
-        let header_content = Paragraph::new(format!(" Uptime: {:.1}s | Total ACKs: {} | Global Avg: {:.2} ops/sec | Peak: {:.2} ops/sec", 
-            time_elapsed, state.total_acks, global_avg, state.peak_throughput))
-            .block(header);
-        f.render_widget(header_content, main_chunks[0]);
-
-        // 2. Main Mission Control (3-way split)
-        let ctrl_chunks = Layout::default()
+        // Middle Row: B (Engine) and C (Hardware)
+        let middle_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(33), Constraint::Percentage(34), Constraint::Percentage(33)].as_ref())
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
             .split(main_chunks[1]);
 
-        // --- Panel 1: Engine Dynamics ---
-        let saturation = last.map(|s| (s.batch_size_avg * 1024.0 / 262144.0 * 100.0).min(100.0)).unwrap_or(0.0);
-        let backpressure_rate = state.backpressure_events as f64 / time_elapsed.max(1.0);
+        // --- SECTION B: ENGINE DYNAMICS ---
+        let mut engine_lines = vec![];
         
-        let engine_content = vec![
-            Line::from(vec![Span::raw(" [ BATCH SATURATION ]")]),
-            Line::from(vec![Span::styled(format!("  {:.1}%", saturation), Style::default().fg(Color::Green))]),
-            Line::from(vec![Span::raw("")]),
-            Line::from(vec![Span::raw(" [ FLUSH REASONS ]")]),
-            Line::from(vec![Span::styled(format!("  FULL: {}  |  EOT: {}", state.full_flushes, state.eot_flushes), Style::default().fg(Color::Yellow))]),
-            Line::from(vec![Span::raw("")]),
-            Line::from(vec![Span::raw(" [ BACKPRESSURE ]")]),
-            Line::from(vec![Span::styled(format!("  {:.2} events/sec", backpressure_rate), 
-                if backpressure_rate > 0.0 { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Green) })]),
-        ];
+        // Batch Saturation Bar
+        let batch_bytes = last_log.map(|l| l.bytes).unwrap_or(0);
+        let batch_sat = (batch_bytes as f64 / 262144.0 * 100.0).min(100.0);
+        let sat_bar = format!("[{:_<20}] {:.1}%", "#".repeat((batch_sat / 5.0) as usize), batch_sat);
+        engine_lines.push(Line::from(vec![Span::styled(" [ BATCH SATURATION ] ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(sat_bar)]));
+        
+        // Flush Ratios
+        let f_full = last_log.map(|l| l.flushes_full).unwrap_or(0);
+        let f_eot = last_log.map(|l| l.flushes_eot).unwrap_or(0);
+        engine_lines.push(Line::from(vec![Span::raw(format!("  FLUSHES: FULL={} | EOT={} (Ratio: {:.1})", f_full, f_eot, f_full as f64 / f_eot.max(1) as f64))]));
+        
+        // WAF
+        let disk_bytes = last_hw.map(|s| s.disk_write_mb_s * 1048576.0).unwrap_or(0.0);
+        let logical_bytes = last_log.map(|l| l.bytes as f64).unwrap_or(0.0);
+        let waf = if logical_bytes > 0.0 { disk_bytes / logical_bytes } else { 0.0 };
+        engine_lines.push(Line::from(vec![
+            Span::raw("  WAF: "), 
+            Span::styled(format!("{:.2}x", waf), if waf > 2.0 { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::Green) }),
+            Span::raw(" (Disk/App Ratio)")
+        ]));
+        
+        engine_lines.push(Line::from(vec![Span::raw("")]));
+        
+        // Search Stats
+        let search = state.search_stats.as_ref();
+        engine_lines.push(Line::from(vec![Span::styled(" [ SEARCH PERFORMANCE ] ", Style::default().add_modifier(Modifier::BOLD))]));
+        if let Some(s) = search {
+            let avg_lat = if s.ops > 0 { s.time_us as f64 / s.ops as f64 } else { 0.0 };
+            engine_lines.push(Line::from(vec![Span::raw(format!("  QPS: {} ops/s | AVG LATENCY: {:.1} us", s.ops, avg_lat))]));
+            engine_lines.push(Line::from(vec![Span::raw(format!("  DIST CALCS/SEC: {} (Work Metric)", s.dist_calcs))]));
+        } else {
+            engine_lines.push(Line::from(vec![Span::raw("  Waiting for search traffic...")]));
+        }
+        
+        let engine_panel = Paragraph::new(engine_lines).block(Block::default().title(" II. ENGINE DYNAMICS ").borders(Borders::ALL));
+        f.render_widget(engine_panel, middle_chunks[0]);
 
-        let engine_panel = Paragraph::new(engine_content)
-            .block(Block::default().title(" I. ENGINE DYNAMICS ").borders(Borders::ALL));
-        f.render_widget(engine_panel, ctrl_chunks[0]);
+        // --- SECTION C: HARDWARE STRESS ---
+        let mut hw_lines = vec![];
+        let cpu_cores = last_hw.map(|s| &s.cpu_usage_pct).cloned().unwrap_or_default();
+        let cpu_user = last_hw.map(|s| &s.cpu_user_pct).cloned().unwrap_or_default();
+        let cpu_sys = last_hw.map(|s| &s.cpu_system_pct).cloned().unwrap_or_default();
+        let cpu_soft = last_hw.map(|s| &s.cpu_softirq_pct).cloned().unwrap_or_default();
 
-        // --- Panel 2: Hardware Stress ---
-        let cpu_cores = last.map(|s| &s.cpu_cores).cloned().unwrap_or_default();
-        let rss_mb = last.map(|s| s.rss_kb as f64 / 1024.0).unwrap_or(0.0);
-        
-        let mut hardware_lines = vec![
-            Line::from(vec![Span::raw(" [ PER-CORE UTILIZATION ]")]),
-        ];
-        
+        hw_lines.push(Line::from(vec![Span::styled(" [ CORE UTILIZATION ] ", Style::default().add_modifier(Modifier::BOLD))]));
         for (i, util) in cpu_cores.iter().enumerate().take(4) {
-            hardware_lines.push(Line::from(vec![
-                Span::raw(format!("  CORE {}: ", i)),
-                Span::styled(format!("{:.1}% ", util), if *util > 90.0 { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Cyan) }),
+            let bar = format!("[{:_<10}]", "#".repeat((util / 10.0) as usize));
+            hw_lines.push(Line::from(vec![
+                Span::raw(format!("  C{:02}: ", i)),
+                Span::styled(bar, Style::default().fg(if *util > 90.0 { Color::Red } else { Color::Cyan })),
+                Span::raw(format!(" {:>5.1}% (U:{:.0}% S:{:.0}% SI:{:.0}%)", 
+                    util, cpu_user.get(i).unwrap_or(&0.0), cpu_sys.get(i).unwrap_or(&0.0), cpu_soft.get(i).unwrap_or(&0.0)))
             ]));
         }
         
-        hardware_lines.push(Line::from(vec![Span::raw("")]));
-        let cpu_sys_val = last.map(|s| s.cpu_sys).unwrap_or(0.0);
-        let cpu_user_val = last.map(|s| s.cpu_user).unwrap_or(0.0);
-        let total_cpu = cpu_sys_val + cpu_user_val;
-        let sys_ratio = if total_cpu > 0.0 { (cpu_sys_val / total_cpu) * 100.0 } else { 0.0 };
+        hw_lines.push(Line::from(vec![Span::raw("")]));
+        let ctxt = last_hw.map(|s| s.context_switches_per_sec).unwrap_or(0.0);
+        hw_lines.push(Line::from(vec![Span::raw(format!("  CONTXT SWITCHES/S: {:.0}", ctxt))]));
+        hw_lines.push(Line::from(vec![Span::raw(format!("  RSS MEMORY: {:.1} MB (PEAK: {:.1} MB)", 
+            last_hw.map(|s| s.rss_mem_mb).unwrap_or(0.0), state.peak_rss_mb))]));
+
+        // Shard Health / Contention
+        hw_lines.push(Line::from(vec![Span::raw("")]));
+        hw_lines.push(Line::from(vec![Span::styled(" [ SHARD HEALTH ] ", Style::default().add_modifier(Modifier::BOLD))]));
+        if let Some(h) = state.health_stats.as_ref() {
+             let total_tick = (h.ingress_ms + h.flush_ms).max(1);
+             let ingress_ratio = h.ingress_ms as f64 / total_tick as f64 * 100.0;
+             let flush_ratio = h.flush_ms as f64 / total_tick as f64 * 100.0;
+             hw_lines.push(Line::from(vec![Span::raw(format!("  CYCLE STARVATION: Log={:.0}% | Persistence={:.0}%", ingress_ratio, flush_ratio))]));
+             if h.flush_ms > 20 {
+                 hw_lines.push(Line::from(vec![Span::styled("  ⚠ READ LATENCY RISK: Flush Stall > 20ms", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))]));
+             }
+        }
+
+        let hw_panel = Paragraph::new(hw_lines).block(Block::default().title(" III. HARDWARE STRESS ").borders(Borders::ALL));
+        f.render_widget(hw_panel, middle_chunks[1]);
+
+        // --- SECTION D: DIAGNOSTICS ---
+        let diag_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+            .split(main_chunks[2]);
+
+        let mut net_lines = vec![];
+        let rx_mbps = last_hw.map(|s| s.net_rx_mbps).unwrap_or(0.0);
+        let tx_mbps = last_hw.map(|s| s.net_tx_mbps).unwrap_or(0.0);
+        let backlog = last_hw.map(|s| s.net_rx_backlog).unwrap_or(0);
+        net_lines.push(Line::from(vec![Span::styled(" [ NETWORK ] ", Style::default().add_modifier(Modifier::BOLD)), 
+            Span::raw(format!("RX: {:.1} Mbps | TX: {:.1} Mbps | Backlog: {} bytes", rx_mbps, tx_mbps, backlog))]));
         
-        hardware_lines.push(Line::from(vec![Span::raw(" [ SYSCALL EFFICIENCY ]")]));
-        hardware_lines.push(Line::from(vec![
-            Span::raw(format!("  User: {:.1}% | Sys: ", cpu_user_val)),
-            Span::styled(format!("{:.1}%", cpu_sys_val), if sys_ratio > 15.0 { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Green) }),
-        ]));
+        let packet_overhead = if rx_mbps > 0.0 { (logical_bytes * 8.0 / 1_000_000.0) / rx_mbps } else { 0.0 };
+        net_lines.push(Line::from(vec![Span::raw(format!("  EFFICIENCY: {:.1}% (VBP Payload / Raw Wire)", packet_overhead * 100.0))]));
+        
+        let net_panel = Paragraph::new(net_lines).block(Block::default().title(" IV. NETWORK DIAGNOSTICS ").borders(Borders::ALL));
+        f.render_widget(net_panel, diag_chunks[0]);
 
-        hardware_lines.push(Line::from(vec![Span::raw("")]));
-        hardware_lines.push(Line::from(vec![Span::raw(" [ RSS MEMORY ]")]));
-        hardware_lines.push(Line::from(vec![Span::styled(format!("  {:.1} MB", rss_mb), Style::default().fg(Color::Magenta))]));
-
-        let hardware_panel = Paragraph::new(hardware_lines)
-            .block(Block::default().title(" II. HARDWARE STRESS ").borders(Borders::ALL));
-        f.render_widget(hardware_panel, ctrl_chunks[1]);
-
-        // --- Panel 3: Network Diagnostics ---
-        let q_depth = last.map(|s| s.socket_q_depth).unwrap_or(0);
-        let inst_throughput = last.map(|s| s.throughput_ops).unwrap_or(0.0);
-        let latency_est = if inst_throughput > 0.0 { (32.0 / inst_throughput) * 1000.0 } else { 0.0 };
-
-        let network_content = vec![
-            Line::from(vec![Span::raw(" [ RECV-QUEUE ]")]),
-            Line::from(vec![Span::styled(format!("  {} packets", q_depth), if q_depth > 100 { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Green) })]),
-            Line::from(vec![Span::raw("")]),
-            Line::from(vec![Span::raw(" [ LITTLE'S LAW LATENCY ]")]),
-            Line::from(vec![Span::styled(format!("  {:.2} ms (theoretical)", latency_est), Style::default().fg(Color::Yellow))]),
-            Line::from(vec![Span::raw("")]),
-            Line::from(vec![Span::raw(" [ INSTANT FLOW ]")]),
-            Line::from(vec![Span::styled(format!("  {:.2} ops/sec", inst_throughput), Style::default().fg(Color::Green))]),
+        // Disk/Verdict (Re-branded as LIVE RECEIPT)
+        let disk_mb_s = last_hw.map(|s| s.disk_write_mb_s).unwrap_or(0.0);
+        let mut io_lines = vec![
+            Line::from(vec![Span::styled(" [ STORAGE ] ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(format!("{:.2} MB/s", disk_mb_s))]),
         ];
 
-        let network_panel = Paragraph::new(network_content)
-            .block(Block::default().title(" III. NETWORK DIAGNOSTICS ").borders(Borders::ALL));
-        f.render_widget(network_panel, ctrl_chunks[2]);
-
-        // 3. Heartbeat Pulse
-        let rows: Vec<Row> = state.shard_pulses.iter().enumerate().map(|(id, pulse)| {
-            let elapsed = pulse.elapsed().as_secs_f64();
-            let status = if elapsed > 2.0 { "STALLED" } else { "ACTIVE" };
-            let style = if status == "STALLED" { Style::default().fg(Color::Red).add_modifier(Modifier::SLOW_BLINK) } else { Style::default().fg(Color::Green) };
+        if let Some(worker) = &state.worker_stats {
+            let stale = state.last_worker_update.map(|t| t.elapsed() > Duration::from_secs(3)).unwrap_or(true);
+            let color = if stale { Color::DarkGray } else { Color::Cyan };
+            let status_text = if stale { format!("IDLE ({})", worker.name) } else { worker.name.clone() };
             
-            Row::new(vec![
-                Cell::from(format!(" SHARD {}", id)),
-                Cell::from(status).style(style),
-                Cell::from(format!("{:.1}s ago", elapsed)),
-                Cell::from(if status == "ACTIVE" { "♥♥♥" } else { "---" }).style(style),
-            ])
-        }).collect();
+            io_lines.push(Line::from(vec![
+                Span::styled(format!(" [ WORKER: {} ]", status_text), Style::default().add_modifier(Modifier::BOLD).fg(color))
+            ]));
+            
+            let drop_color = if worker.drops > 0 { Color::Red } else { Color::Green };
+            io_lines.push(Line::from(vec![
+                Span::raw(" ACKs: "), Span::styled(format!("{}/{}", worker.acks, worker.target), Style::default().fg(Color::Yellow)),
+                Span::raw(" | Drops: "), Span::styled(worker.drops.to_string(), Style::default().fg(drop_color)),
+            ]));
+            
+            io_lines.push(Line::from(vec![
+                Span::raw(" P50: "), Span::styled(format!("{}us", worker.p50_us), Style::default().fg(Color::Cyan)),
+                Span::raw(" | P99: "), Span::styled(format!("{}us", worker.p99_us), Style::default().fg(Color::Magenta)),
+            ]));
+        } else {
+             io_lines.push(Line::from(vec![Span::styled(" [ WORKER: WAITING... ]", Style::default().fg(Color::DarkGray))]));
+             io_lines.push(Line::from(vec![Span::raw("  Launch stress_test to see live P99 stats.")]));
+        }
 
-        let pulse_table = Table::new(rows, [Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(25), Constraint::Percentage(25)].as_ref())
-            .header(Row::new(vec!["UNIT", "STATUS", "LAST PULSE", "HEARTBEAT"]).style(Style::default().add_modifier(Modifier::BOLD)))
-            .block(Block::default().title(" SHARD PULSE MONITOR ").borders(Borders::ALL));
-        f.render_widget(pulse_table, main_chunks[2]);
-
-        // 4. Final Verdict
-        let verdict_text = if state.total_acks >= 80000 { 
-            format!("SUCCESS: SATURATION BURN OVER. FINAL THROUGHPUT: {:.2} ops/sec", global_avg)
-        } else { 
-            "STATUS: VORTEX ENGINE ONLINE - MONITORING BURN...".to_string() 
-        };
-        
-        let verdict_color = if state.total_acks >= 80000 { Color::Cyan } else { Color::White };
-        let verdict = Paragraph::new(verdict_text)
-            .block(Block::default().borders(Borders::ALL))
-            .style(Style::default().fg(verdict_color).add_modifier(Modifier::BOLD));
-        f.render_widget(verdict, main_chunks[3]);
+        let io_panel = Paragraph::new(io_lines).block(Block::default().title(" V. LIVE RECEIPT ").borders(Borders::ALL));
+        f.render_widget(io_panel, diag_chunks[1]);
     }
+}
+
+// Wrapper for main.rs to call
+pub fn draw_ui(f: &mut Frame<'_>, state: &AppState) {
+    TuiAgent::draw_ui(f, state);
 }
