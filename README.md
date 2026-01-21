@@ -1,7 +1,7 @@
 # VORTEX: The Kernel-Bypass Vector Engine
 
 > [!TIP]
-> **MISSION ACOMPLISHED**: VORTEX has achieved sustained throughput of **>40,000 Ops/Sec** with sub-millisecond latency on standard hardware, validated by the "Elite Mission Control" Command Center.
+> **VERSION 1.0 "THE FOREMAN"**: VORTEX has achieved sustained throughput of **>48,000 Ops/Sec** with real-time P99 visibility, validated by the modular "Foreman" Command Center.
 
 ## 🚀 The VORTEX Advantage
 VORTEX is a research-grade vector database built to solve the **Persistence Bottleneck**. By bypassing the OS Page Cache and pinning "Shard Reactors" to physical cores, VORTEX achieves what traditional databases cannot:
